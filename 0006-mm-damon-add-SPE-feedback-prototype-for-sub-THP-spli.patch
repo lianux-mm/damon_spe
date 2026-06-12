@@ -1,0 +1,298 @@
+From 35a6d6df26a8d9c5743d23c3fe954198b1de4d56 Mon Sep 17 00:00:00 2001
+From: wang lian <lianux.mm@gmail.com>
+Date: Thu, 11 Jun 2026 15:42:39 +0800
+Subject: [RFC PATCH 6/8] mm/damon: add SPE feedback prototype for sub-THP
+ split decisions
+
+Introduce a CONFIG_DAMON_SPE prototype that provides sub-THP access
+heatmap data to DAMOS_MTHP_SPLIT, enabling intelligent split decisions
+based on access patterns within THPs.
+
+The prototype uses PTE access bits via folio_walk for THPs that have
+been previously split to PTEs.  For PMD-mapped THPs (the common case),
+it returns -EOPNOTSUPP and the split handler falls back to unconditional
+split.  This mirrors the behavior gap that ARM SPE fills: SPE samples
+provide per-subpage access data without requiring the PMD to be split
+first.
+
+Architecture:
+  mm/damon/spe.h        - Interface: damon_spe_folio_heatmap(),
+                          damon_spe_hot_fraction()
+  mm/damon/spe.c        - Prototype implementation using PTE access bits
+  mm/damon/vaddr.c      - Integration: skip split if THP is >80% hot
+
+Production path (Kunpeng 920+):
+  Replace the PTE-walk implementation with ARM SPE PMU buffer reading
+  via perf_event_create_kernel_counter(), decoding SPE records to
+  extract {virt_addr, phys_addr, access_type}, and aggregating into
+  a per-process access heatmap.
+
+Co-developed-by: Kunwu Chan <kunwu.chan@gmail.com>
+Signed-off-by: Kunwu Chan <kunwu.chan@gmail.com>
+Signed-off-by: Wang Lian <lianux.mm@gmail.com>
+---
+ mm/damon/Kconfig  |  12 ++++++
+ mm/damon/Makefile |   1 +
+ mm/damon/spe.c    | 100 ++++++++++++++++++++++++++++++++++++++++++++++
+ mm/damon/spe.h    |  70 ++++++++++++++++++++++++++++++++
+ mm/damon/vaddr.c  |  16 +++++++-
+ 5 files changed, 197 insertions(+), 2 deletions(-)
+ create mode 100644 mm/damon/spe.c
+ create mode 100644 mm/damon/spe.h
+
+diff --git a/mm/damon/Kconfig b/mm/damon/Kconfig
+index 34631a44cdec..ea75a8dab989 100644
+--- a/mm/damon/Kconfig
++++ b/mm/damon/Kconfig
+@@ -121,4 +121,16 @@ config DAMON_STAT_ENABLED_DEFAULT
+ 	  Whether to enable DAMON_STAT by default.  Users can disable it in
+ 	  boot or runtime using its 'enabled' parameter.
+ 
++config DAMON_SPE
++	bool "DAMON SPE feedback for sub-THP access monitoring (prototype)"
++	depends on DAMON_VADDR
++	help
++	  Enable sub-THP access heatmap feedback for DAMOS_MTHP_SPLIT.
++	  Currently a prototype: uses PTE access bits for THPs that have
++	  been split to PTEs, returns "no data" for PMD-mapped THPs.
++
++	  On hardware with ARM SPE (e.g. Kunpeng 920), this will be
++	  extended to provide per-subpage access data without needing to
++	  split the PMD first, enabling precise mTHP split decisions.
++
+ endmenu
+diff --git a/mm/damon/Makefile b/mm/damon/Makefile
+index d8d6bf5f8bff..507b43a9f009 100644
+--- a/mm/damon/Makefile
++++ b/mm/damon/Makefile
+@@ -7,3 +7,4 @@ obj-$(CONFIG_DAMON_SYSFS)	+= sysfs-common.o sysfs-schemes.o sysfs.o
+ obj-$(CONFIG_DAMON_RECLAIM)	+= modules-common.o reclaim.o
+ obj-$(CONFIG_DAMON_LRU_SORT)	+= modules-common.o lru_sort.o
+ obj-$(CONFIG_DAMON_STAT)	+= modules-common.o stat.o
++obj-$(CONFIG_DAMON_SPE)		+= spe.o
+diff --git a/mm/damon/spe.c b/mm/damon/spe.c
+new file mode 100644
+index 000000000000..71e47011d761
+--- /dev/null
++++ b/mm/damon/spe.c
+@@ -0,0 +1,100 @@
++// SPDX-License-Identifier: GPL-2.0
++/*
++ * DAMON SPE (Statistical Profiling Extension) feedback — prototype
++ *
++ * Provides sub-THP access heatmap for intelligent split decisions.
++ *
++ * Prototype (this file):
++ *   Uses PTE access bits via folio_walk.  Works only when a THP has been
++ *   previously split to PTEs (by an earlier split_folio_to_order call).
++ *   Returns -EOPNOTSUPP for PMD-mapped THPs.
++ *
++ * Production (TODO — Kunpeng 920+):
++ *   1. Open a kernel-internal SPE perf event via perf_event_create_kernel_counter
++ *   2. On SPE buffer overflow IRQ, decode SPE records:
++ *      - Extract {virt_addr, phys_addr, access_type} from each record
++ *      - SPE packet format: ARM ARM DDI 0487, Chapter D9 "SPE"
++ *   3. Aggregate into a per-process rbtree: {pfn → access_count[] per subpage}
++ *   4. On damon_spe_folio_heatmap(), query the rbtree for the folio's pfn
++ *   5. Return a bitmap of accessed sub-pages at target_order granularity
++ *
++ * Copyright (C) 2026 Wang Lian <lianux.mm@gmail.com>
++ */
++
++#define pr_fmt(fmt) "damon-spe: " fmt
++
++#include <linux/mm.h>
++#include <linux/pagewalk.h>
++#include <linux/huge_mm.h>
++#include <linux/bitmap.h>
++#include "spe.h"
++
++/* Max sub-pages when splitting a PMD-order THP to base pages (order 0) */
++#define DAMON_SPE_MAX_CHUNKS	512
++
++int damon_spe_folio_heatmap(struct folio *folio, struct vm_area_struct *vma,
++			    unsigned long addr, unsigned int target_order,
++			    unsigned long *hot_bitmap)
++{
++	unsigned long num_chunks = folio_nr_pages(folio) >> target_order;
++	unsigned long chunk_sz = PAGE_SIZE << target_order;
++	unsigned long i;
++	struct folio_walk fw;
++	struct folio *sub_folio;
++
++	if (!folio || !vma || !hot_bitmap)
++		return -EINVAL;
++	if (target_order >= folio_order(folio))
++		return -EINVAL;
++
++	bitmap_zero(hot_bitmap, num_chunks);
++
++	for (i = 0; i < num_chunks; i++) {
++		unsigned long chunk_addr = addr + i * chunk_sz;
++
++		sub_folio = folio_walk_start(&fw, vma, chunk_addr, 0);
++		if (!sub_folio) {
++			bitmap_zero(hot_bitmap, num_chunks);
++			return -EOPNOTSUPP;
++		}
++
++		/*
++		 * PMD-mapped THP: folio_walk_start succeeds but all sub-page
++		 * addresses share the same PMD access bit.  Return -EOPNOTSUPP
++		 * so the caller falls back to unconditional split.
++		 */
++		if (fw.level == FW_LEVEL_PMD) {
++			folio_walk_end(&fw, vma);
++			bitmap_zero(hot_bitmap, num_chunks);
++			return -EOPNOTSUPP;
++		}
++
++		if (fw.level == FW_LEVEL_PTE && pte_young(fw.pte))
++			__set_bit(i, hot_bitmap);
++
++		folio_walk_end(&fw, vma);
++	}
++
++	return (int)num_chunks;
++}
++EXPORT_SYMBOL_GPL(damon_spe_folio_heatmap);
++
++int damon_spe_hot_fraction(struct folio *folio, struct vm_area_struct *vma,
++			   unsigned long addr, unsigned int target_order)
++{
++	unsigned long num_chunks = folio_nr_pages(folio) >> target_order;
++	DECLARE_BITMAP(hot_bitmap, DAMON_SPE_MAX_CHUNKS);
++	int ret, hot;
++
++	if (num_chunks > DAMON_SPE_MAX_CHUNKS)
++		return -ERANGE;
++
++	ret = damon_spe_folio_heatmap(folio, vma, addr, target_order,
++				      hot_bitmap);
++	if (ret < 0)
++		return ret;
++
++	hot = bitmap_weight(hot_bitmap, num_chunks);
++	return (hot * 100) / (int)num_chunks;
++}
++EXPORT_SYMBOL_GPL(damon_spe_hot_fraction);
+diff --git a/mm/damon/spe.h b/mm/damon/spe.h
+new file mode 100644
+index 000000000000..4922f991d734
+--- /dev/null
++++ b/mm/damon/spe.h
+@@ -0,0 +1,70 @@
++/* SPDX-License-Identifier: GPL-2.0 */
++/*
++ * DAMON SPE (Statistical Profiling Extension) feedback
++ *
++ * Provides sub-THP access heatmap for intelligent split decisions.
++ * Prototype: uses PTE access bits on non-SPE hardware.
++ * Production: integrates ARM SPE PMU on supported platforms (e.g. Kunpeng 920).
++ *
++ * Copyright (C) 2026 Wang Lian <lianux.mm@gmail.com>
++ */
++
++#ifndef _DAMON_SPE_H
++#define _DAMON_SPE_H
++
++#include <linux/mm_types.h>
++
++#ifdef CONFIG_DAMON_SPE
++
++/*
++ * damon_spe_folio_heatmap - Get sub-THP access bitmap for a folio
++ * @folio: The folio to query (must be locked or ref'd by caller)
++ * @vma:   VMA containing the folio (for page table walk)
++ * @addr:  Virtual address of the folio
++ * @target_order: Granularity of the bitmap (each bit = one chunk of this order)
++ * @hot_bitmap:   Output bitmap, bit N=1 means Nth chunk was accessed
++ *
++ * Returns: number of bits in the bitmap on success,
++ *          -EOPNOTSUPP if SPE data is not available (caller should fall back
++ *          to unconditional split).
++ *
++ * On hardware with ARM SPE, reads the PMU buffer to determine which sub-pages
++ * within a THP have been accessed.  The bitmap is relative to @target_order:
++ * e.g. for a PMD-order THP (order=9) with target_order=2:
++ *   - The THP has 2^(9-2) = 128 chunks of order-2
++ *   - hot_bitmap has 128 bits, max return value 128
++ *
++ * On hardware without SPE, splits the PMD to PTEs and checks access bits,
++ * but only if the PMD is already split.  Returns -EOPNOTSUPP otherwise.
++ */
++int damon_spe_folio_heatmap(struct folio *folio, struct vm_area_struct *vma,
++			    unsigned long addr, unsigned int target_order,
++			    unsigned long *hot_bitmap);
++
++/*
++ * damon_spe_hot_fraction - Fraction of chunks that were accessed
++ *
++ * Convenience wrapper: returns the fraction (0..100) of hot chunks.
++ * Returns -EOPNOTSUPP if data unavailable.
++ */
++int damon_spe_hot_fraction(struct folio *folio, struct vm_area_struct *vma,
++			   unsigned long addr, unsigned int target_order);
++
++#else /* !CONFIG_DAMON_SPE */
++
++static inline int damon_spe_folio_heatmap(struct folio *folio,
++		struct vm_area_struct *vma, unsigned long addr,
++		unsigned int target_order, unsigned long *hot_bitmap)
++{
++	return -EOPNOTSUPP;
++}
++
++static inline int damon_spe_hot_fraction(struct folio *folio,
++		struct vm_area_struct *vma, unsigned long addr,
++		unsigned int target_order)
++{
++	return -EOPNOTSUPP;
++}
++
++#endif /* CONFIG_DAMON_SPE */
++#endif /* _DAMON_SPE_H */
+diff --git a/mm/damon/vaddr.c b/mm/damon/vaddr.c
+index 6e337fc60703..8df827007093 100644
+--- a/mm/damon/vaddr.c
++++ b/mm/damon/vaddr.c
+@@ -18,6 +18,7 @@
+ 
+ #include "../internal.h"
+ #include "ops-common.h"
++#include "spe.h"
+ 
+ #ifdef CONFIG_DAMON_VADDR_KUNIT_TEST
+ #undef DAMON_MIN_REGION_SZ
+@@ -947,6 +948,7 @@ static unsigned long damos_va_mthp_split(struct damon_target *target,
+ 	struct vm_area_struct *vma;
+ 	struct folio *folio;
+ 	struct folio_walk fw;
++	int hot_pct;
+ 
+ 	mm = damon_get_mm(target);
+ 	if (!mm)
+@@ -974,8 +976,18 @@ static unsigned long damos_va_mthp_split(struct damon_target *target,
+ 			folio_get(folio);
+ 			folio_walk_end(&fw, vma);
+ 
+-			if (!split_folio_to_order(folio, target_order))
+-				applied += chunk_sz;
++			/*
++			 * Query sub-THP access hotness.  On SPE-capable
++			 * hardware this reads PMU samples; the prototype
++			 * checks PTE access bits.  Returns -EOPNOTSUPP
++			 * when data is unavailable (split unconditionally).
++			 */
++			hot_pct = damon_spe_hot_fraction(folio, vma, addr,
++							 target_order);
++			if (hot_pct < 80) {
++				if (!split_folio_to_order(folio, target_order))
++					applied += chunk_sz;
++			}
+ 
+ 			folio_unlock(folio);
+ 			folio_put(folio);
+-- 
+2.50.1 (Apple Git-155)
+

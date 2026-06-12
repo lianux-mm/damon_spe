@@ -1,0 +1,655 @@
+From ca15ff7331f1eb05806fee2ae88840b971595e4b Mon Sep 17 00:00:00 2001
+From: wang lian <lianux.mm@gmail.com>
+Date: Fri, 12 Jun 2026 16:34:27 +0800
+Subject: [RFC PATCH 8/8] mm/damon: upgrade SPE feedback with rbtree histogram
+ and debugfs bridge
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Replace the PTE-only SPE prototype with a proper rbtree-based sub-page
+access histogram that supports multiple data sources:
+
+Data structure:
+- Per-folio rbtree keyed by THP-aligned PFN
+- Each entry tracks access_count[512] (one counter per 4KB subpage)
+- Aging: entries older than 30s are pruned periodically
+
+Two data source paths:
+- Phase 2b (ready): userspace SPE daemon decodes ARM SPE records,
+  feeds PFNs via debugfs (/sys/kernel/debug/damon/spe_feed)
+- Phase 2c (requires hardware): kernel perf_event_create_kernel_counter
+  for ARM SPE, overflow handler calls damon_spe_record_access()
+
+Query path (unchanged flow, upgraded implementation):
+- damon_spe_folio_heatmap() first checks the rbtree
+- Falls back to PTE access bits if no SPE data available
+- Returns -EOPNOTSUPP when neither source has data
+
+New APIs:
+- damon_spe_record_access(pfn, pid): record a single access
+- damon_spe_prune(): remove stale entries (called from aggregation cycle)
+- damon_spe_stats(): query rbtree statistics
+
+The debugfs interface provides:
+- /sys/kernel/debug/damon/spe_feed (write): accept one PFN per line
+- /sys/kernel/debug/damon/spe_stats (read): show current histogram
+
+This completes the Phase 2b data pipeline: userspace SPE daemon
+decodes ARM SPE → feeds PFNs via debugfs → kernel rbtree →
+damon_spe_folio_heatmap() → split decision.
+
+Co-Authored-By: Claude Opus 4.7 <noreply@anthropic.com>
+---
+ mm/damon/core.c |   3 +
+ mm/damon/spe.c  | 450 ++++++++++++++++++++++++++++++++++++++++++++----
+ mm/damon/spe.h  |  50 +++---
+ 3 files changed, 436 insertions(+), 67 deletions(-)
+
+diff --git a/mm/damon/core.c b/mm/damon/core.c
+index 265d51ade25b..0805e71a90d8 100644
+--- a/mm/damon/core.c
++++ b/mm/damon/core.c
+@@ -20,6 +20,7 @@
+ 
+ /* for damon_get_folio() used by node eligible memory metrics */
+ #include "ops-common.h"
++#include "spe.h"
+ 
+ #define CREATE_TRACE_POINTS
+ #include <trace/events/damon.h>
+@@ -2987,6 +2988,8 @@ static void kdamond_apply_schemes(struct damon_ctx *c)
+ 	if (!has_schemes_to_apply)
+ 		return;
+ 
++	damon_spe_prune();
++
+ 	max_region_sz = damon_region_sz_limit(c);
+ 	mutex_lock(&c->walk_control_lock);
+ 	damon_for_each_target(t, c) {
+diff --git a/mm/damon/spe.c b/mm/damon/spe.c
+index 71e47011d761..cabff9b24c0a 100644
+--- a/mm/damon/spe.c
++++ b/mm/damon/spe.c
+@@ -1,22 +1,23 @@
+ // SPDX-License-Identifier: GPL-2.0
+ /*
+- * DAMON SPE (Statistical Profiling Extension) feedback — prototype
++ * DAMON SPE (Statistical Profiling Extension) feedback
+  *
+  * Provides sub-THP access heatmap for intelligent split decisions.
+  *
+- * Prototype (this file):
+- *   Uses PTE access bits via folio_walk.  Works only when a THP has been
+- *   previously split to PTEs (by an earlier split_folio_to_order call).
+- *   Returns -EOPNOTSUPP for PMD-mapped THPs.
++ * Architecture:
++ *   Phase 2a (current): PTE access bits via folio_walk.
++ *     Works only when a THP has been previously split to PTEs.
++ *     Returns -EOPNOTSUPP for PMD-mapped THPs.
+  *
+- * Production (TODO — Kunpeng 920+):
+- *   1. Open a kernel-internal SPE perf event via perf_event_create_kernel_counter
+- *   2. On SPE buffer overflow IRQ, decode SPE records:
+- *      - Extract {virt_addr, phys_addr, access_type} from each record
+- *      - SPE packet format: ARM ARM DDI 0487, Chapter D9 "SPE"
+- *   3. Aggregate into a per-process rbtree: {pfn → access_count[] per subpage}
+- *   4. On damon_spe_folio_heatmap(), query the rbtree for the folio's pfn
+- *   5. Return a bitmap of accessed sub-pages at target_order granularity
++ *   Phase 2b (userspace): spe_hist daemon decodes SPE in userspace,
++ *     feeds {pfn, subpage_idx} via debugfs/sysfs into the rbtree below.
++ *
++ *   Phase 2c (kernel): perf_event_create_kernel_counter for ARM SPE,
++ *     overflow handler aggregates into rbtree.  Requires SPE hardware.
++ *
++ * Data structure:
++ *   Per-folio rbtree keyed by PFN, storing per-subpage access counts.
++ *   Entries are aged and pruned periodically.
+  *
+  * Copyright (C) 2026 Wang Lian <lianux.mm@gmail.com>
+  */
+@@ -27,55 +28,269 @@
+ #include <linux/pagewalk.h>
+ #include <linux/huge_mm.h>
+ #include <linux/bitmap.h>
++#include <linux/rbtree.h>
++#include <linux/spinlock.h>
++#include <linux/slab.h>
++#include <linux/jiffies.h>
++#include <linux/sched.h>
++#include <linux/debugfs.h>
++#include <linux/seq_file.h>
++#include <linux/uaccess.h>
++#include <linux/init.h>
+ #include "spe.h"
+ 
+-/* Max sub-pages when splitting a PMD-order THP to base pages (order 0) */
++/* Max sub-pages when querying at order 0 */
+ #define DAMON_SPE_MAX_CHUNKS	512
+ 
++/* Max folio entries in the rbtree (per-mm or global) */
++#define DAMON_SPE_MAX_ENTRIES	1024
++
++/* Entry considered stale after this many jiffies (default: 30s) */
++#define DAMON_SPE_ENTRY_TTL	(30 * HZ)
++
++/*
++ * Per-folio access histogram entry.
++ * Keyed by pfn in an rbtree.  Each entry tracks access count per subpage.
++ * The access_count array is sized for PMD-order / 0 = 512 4KB subpages.
++ */
++struct damon_spe_entry {
++	struct rb_node		node;
++	unsigned long		pfn;		/* THP-aligned PFN */
++	pid_t			pid;		/* owner process */
++	unsigned long		access_count[DAMON_SPE_MAX_CHUNKS];
++	unsigned long		total_accesses;
++	unsigned long		last_access;	/* jiffies of last update */
++};
++
++static struct rb_root spe_tree = RB_ROOT;
++static DEFINE_SPINLOCK(spe_lock);
++static unsigned int spe_nr_entries;
++
++/* Forward declarations */
++static void spe_prune_stale(void);
++
++/*
++ * Find an entry by PFN.  Must be called with spe_lock held.
++ */
++static struct damon_spe_entry *spe_find(unsigned long pfn)
++{
++	struct rb_node *node = spe_tree.rb_node;
++
++	while (node) {
++		struct damon_spe_entry *e =
++			rb_entry(node, struct damon_spe_entry, node);
++
++		if (pfn < e->pfn)
++			node = node->rb_left;
++		else if (pfn > e->pfn)
++			node = node->rb_right;
++		else
++			return e;
++	}
++	return NULL;
++}
++
++/*
++ * Insert a new entry.  Must be called with spe_lock held.
++ * Returns the new entry, or NULL if the tree is full.
++ */
++static struct damon_spe_entry *spe_insert(unsigned long pfn, pid_t pid)
++{
++	struct rb_node **new = &spe_tree.rb_node, *parent = NULL;
++	struct damon_spe_entry *e;
++
++	if (spe_nr_entries >= DAMON_SPE_MAX_ENTRIES) {
++		spe_prune_stale();
++		if (spe_nr_entries >= DAMON_SPE_MAX_ENTRIES)
++			return NULL;
++	}
++
++	e = kzalloc(sizeof(*e), GFP_ATOMIC);
++	if (!e)
++		return NULL;
++
++	e->pfn = pfn;
++	e->pid = pid;
++	e->last_access = jiffies;
++
++	while (*new) {
++		struct damon_spe_entry *this =
++			rb_entry(*new, struct damon_spe_entry, node);
++
++		parent = *new;
++		if (pfn < this->pfn)
++			new = &((*new)->rb_left);
++		else if (pfn > this->pfn)
++			new = &((*new)->rb_right);
++		else {
++			/* Race: another CPU inserted the same PFN */
++			kfree(e);
++			return this;
++		}
++	}
++
++	rb_link_node(&e->node, parent, new);
++	rb_insert_color(&e->node, &spe_tree);
++	spe_nr_entries++;
++	return e;
++}
++
++/*
++ * Prune entries that haven't been updated for DAMON_SPE_ENTRY_TTL.
++ * Must be called with spe_lock held.
++ */
++static void spe_prune_stale(void)
++{
++	struct rb_node *node, *next;
++	unsigned long deadline = jiffies - DAMON_SPE_ENTRY_TTL;
++
++	node = rb_first(&spe_tree);
++	while (node) {
++		struct damon_spe_entry *e =
++			rb_entry(node, struct damon_spe_entry, node);
++
++		next = rb_next(node);
++
++		if (time_before(e->last_access, deadline)) {
++			rb_erase(&e->node, &spe_tree);
++			spe_nr_entries--;
++			kfree(e);
++		}
++		node = next;
++	}
++}
++
++/*
++ * damon_spe_record_access - Record a single subpage access from SPE trace
++ * @pfn:	Physical page frame number (can be any page within a THP)
++ * @pid:	Process ID that performed the access
++ *
++ * The PFN is automatically aligned to the THP base.  The subpage index
++ * within the THP is derived from the low bits of the PFN.
++ *
++ * This is called either from:
++ *   (a) the kernel SPE overflow handler (Phase 2c), or
++ *   (b) a userspace daemon via debugfs/sysfs (Phase 2b).
++ *
++ * Context: can be called from IRQ context (holds spe_lock with GFP_ATOMIC).
++ */
++void damon_spe_record_access(unsigned long pfn, pid_t pid)
++{
++	unsigned long thp_pfn = pfn & ~(unsigned long)(DAMON_SPE_MAX_CHUNKS - 1);
++	unsigned int idx = pfn & (DAMON_SPE_MAX_CHUNKS - 1);
++	struct damon_spe_entry *e;
++	unsigned long flags;
++
++	if (idx >= DAMON_SPE_MAX_CHUNKS)
++		return;
++
++	spin_lock_irqsave(&spe_lock, flags);
++
++	e = spe_find(thp_pfn);
++	if (!e)
++		e = spe_insert(thp_pfn, pid);
++
++	if (e) {
++		e->access_count[idx]++;
++		e->total_accesses++;
++		e->last_access = jiffies;
++	}
++
++	spin_unlock_irqrestore(&spe_lock, flags);
++}
++EXPORT_SYMBOL_GPL(damon_spe_record_access);
++
++/*
++ * damon_spe_folio_heatmap - Get sub-THP access bitmap for a folio
++ *
++ * First tries the SPE rbtree (accumulated from SPE sampling).
++ * Falls back to PTE access bits if no SPE data is available.
++ *
++ * Returns the number of chunks on success, negative error otherwise.
++ */
+ int damon_spe_folio_heatmap(struct folio *folio, struct vm_area_struct *vma,
+ 			    unsigned long addr, unsigned int target_order,
+ 			    unsigned long *hot_bitmap)
+ {
+ 	unsigned long num_chunks = folio_nr_pages(folio) >> target_order;
+ 	unsigned long chunk_sz = PAGE_SIZE << target_order;
+-	unsigned long i;
+-	struct folio_walk fw;
+-	struct folio *sub_folio;
++	unsigned long pfn;
++	unsigned long flags;
++	struct damon_spe_entry *e;
++	int i;
+ 
+ 	if (!folio || !vma || !hot_bitmap)
+ 		return -EINVAL;
+ 	if (target_order >= folio_order(folio))
+ 		return -EINVAL;
+ 
+-	bitmap_zero(hot_bitmap, num_chunks);
++	pfn = folio_pfn(folio);
+ 
+-	for (i = 0; i < num_chunks; i++) {
+-		unsigned long chunk_addr = addr + i * chunk_sz;
++	/*
++	 * Phase 2b/2c path: query the SPE rbtree.
++	 * If we have aggregated SPE data for this folio, use it.
++	 */
++	spin_lock_irqsave(&spe_lock, flags);
++	e = spe_find(pfn);
++	if (e && e->total_accesses > 0) {
++		bitmap_zero(hot_bitmap, num_chunks);
++		for (i = 0; i < num_chunks; i++) {
++			unsigned long sum = 0;
++			int j;
++			/*
++			 * Aggregate subpage counts within each target_order
++			 * chunk.  A chunk at target_order covers
++			 * (chunk_sz / PAGE_SIZE) subpages.
++			 */
++			unsigned int spp = chunk_sz >> PAGE_SHIFT;
+ 
+-		sub_folio = folio_walk_start(&fw, vma, chunk_addr, 0);
+-		if (!sub_folio) {
+-			bitmap_zero(hot_bitmap, num_chunks);
+-			return -EOPNOTSUPP;
++			for (j = 0; j < spp; j++) {
++				unsigned int idx = i * spp + j;
++				if (idx < DAMON_SPE_MAX_CHUNKS)
++					sum += e->access_count[idx];
++			}
++			if (sum > 0)
++				__set_bit(i, hot_bitmap);
+ 		}
++		spin_unlock_irqrestore(&spe_lock, flags);
++		return (int)num_chunks;
++	}
++	spin_unlock_irqrestore(&spe_lock, flags);
++
++	/*
++	 * Phase 2a fallback: walk PTEs to check access bits.
++	 * Only works when the THP has been split to PTEs.
++	 */
++	{
++		unsigned long i;
++		struct folio_walk fw;
++		struct folio *sub_folio;
++
++		bitmap_zero(hot_bitmap, num_chunks);
++
++		for (i = 0; i < num_chunks; i++) {
++			unsigned long chunk_addr = addr + i * chunk_sz;
++
++			sub_folio = folio_walk_start(&fw, vma, chunk_addr, 0);
++			if (!sub_folio) {
++				bitmap_zero(hot_bitmap, num_chunks);
++				return -EOPNOTSUPP;
++			}
++
++			if (fw.level == FW_LEVEL_PMD) {
++				folio_walk_end(&fw, vma);
++				bitmap_zero(hot_bitmap, num_chunks);
++				return -EOPNOTSUPP;
++			}
++
++			if (fw.level == FW_LEVEL_PTE && pte_young(fw.pte))
++				__set_bit(i, hot_bitmap);
+ 
+-		/*
+-		 * PMD-mapped THP: folio_walk_start succeeds but all sub-page
+-		 * addresses share the same PMD access bit.  Return -EOPNOTSUPP
+-		 * so the caller falls back to unconditional split.
+-		 */
+-		if (fw.level == FW_LEVEL_PMD) {
+ 			folio_walk_end(&fw, vma);
+-			bitmap_zero(hot_bitmap, num_chunks);
+-			return -EOPNOTSUPP;
+ 		}
+ 
+-		if (fw.level == FW_LEVEL_PTE && pte_young(fw.pte))
+-			__set_bit(i, hot_bitmap);
+-
+-		folio_walk_end(&fw, vma);
++		return (int)num_chunks;
+ 	}
+-
+-	return (int)num_chunks;
+ }
+ EXPORT_SYMBOL_GPL(damon_spe_folio_heatmap);
+ 
+@@ -98,3 +313,162 @@ int damon_spe_hot_fraction(struct folio *folio, struct vm_area_struct *vma,
+ 	return (hot * 100) / (int)num_chunks;
+ }
+ EXPORT_SYMBOL_GPL(damon_spe_hot_fraction);
++
++/*
++ * damon_spe_prune - Periodic aging of stale entries
++ *
++ * Called from DAMON's aggregation cycle (or a periodic timer).
++ * Removes entries that haven't been updated within DAMON_SPE_ENTRY_TTL.
++ */
++void damon_spe_prune(void)
++{
++	unsigned long flags;
++
++	spin_lock_irqsave(&spe_lock, flags);
++	spe_prune_stale();
++	spin_unlock_irqrestore(&spe_lock, flags);
++}
++
++/*
++ * damon_spe_stats - Return current SPE statistics
++ *
++ * For debugging / sysfs reporting.
++ */
++void damon_spe_stats(unsigned int *nr_entries, unsigned long *total_accesses)
++{
++	struct rb_node *node;
++	unsigned long flags;
++	unsigned int count = 0;
++	unsigned long total = 0;
++
++	spin_lock_irqsave(&spe_lock, flags);
++	for (node = rb_first(&spe_tree); node; node = rb_next(node)) {
++		struct damon_spe_entry *e =
++			rb_entry(node, struct damon_spe_entry, node);
++		count++;
++		total += e->total_accesses;
++	}
++	spin_unlock_irqrestore(&spe_lock, flags);
++
++	if (nr_entries)
++		*nr_entries = count;
++	if (total_accesses)
++		*total_accesses = total;
++}
++EXPORT_SYMBOL_GPL(damon_spe_stats);
++
++/* ---- debugfs interface for Phase 2b (userspace daemon → kernel rbtree) ---- */
++
++static struct dentry *damon_spe_dentry;
++
++/*
++ * spe_feed write: accept one PFN per line (hex or decimal).
++ * The PFN is recorded as an access via damon_spe_record_access().
++ *
++ * Usage from userspace:
++ *   echo 0x12345678 > /sys/kernel/debug/damon/spe_feed
++ *
++ * For bulk feed from SPE daemon:
++ *   cat spe_pfns.txt > /sys/kernel/debug/damon/spe_feed
++ */
++static ssize_t spe_feed_write(struct file *file, const char __user *buf,
++			      size_t count, loff_t *ppos)
++{
++	char line[32];
++	size_t len = min(count, sizeof(line) - 1);
++	unsigned long pfn;
++
++	if (copy_from_user(line, buf, len))
++		return -EFAULT;
++	line[len] = '\0';
++
++	/* Strip trailing newline */
++	if (len > 0 && line[len - 1] == '\n')
++		line[len - 1] = '\0';
++
++	if (kstrtoul(line, 0, &pfn) == 0 && pfn != 0)
++		damon_spe_record_access(pfn, 0);
++
++	return count;
++}
++
++/*
++ * spe_stats read: show current SPE rbtree statistics.
++ *
++ * Usage:
++ *   cat /sys/kernel/debug/damon/spe_stats
++ */
++static int spe_stats_show(struct seq_file *m, void *v)
++{
++	struct rb_node *node;
++	unsigned long flags;
++	unsigned int count = 0;
++	unsigned long total = 0;
++
++	spin_lock_irqsave(&spe_lock, flags);
++	for (node = rb_first(&spe_tree); node; node = rb_next(node)) {
++		struct damon_spe_entry *e =
++			rb_entry(node, struct damon_spe_entry, node);
++		count++;
++		total += e->total_accesses;
++	}
++	spin_unlock_irqrestore(&spe_lock, flags);
++
++	seq_printf(m, "nr_entries=%u total_accesses=%lu\n", count, total);
++
++	/* Show top entries */
++	spin_lock_irqsave(&spe_lock, flags);
++	for (node = rb_first(&spe_tree); node && count > 0; node = rb_next(node)) {
++		struct damon_spe_entry *e =
++			rb_entry(node, struct damon_spe_entry, node);
++		unsigned int hot_pages = 0;
++		int i;
++
++		for (i = 0; i < DAMON_SPE_MAX_CHUNKS; i++)
++			if (e->access_count[i])
++				hot_pages++;
++
++		seq_printf(m, "  pfn=0x%lx pid=%d total=%lu hot_pages=%u/%d\n",
++			   e->pfn, e->pid, e->total_accesses,
++			   hot_pages, DAMON_SPE_MAX_CHUNKS);
++	}
++	spin_unlock_irqrestore(&spe_lock, flags);
++
++	return 0;
++}
++
++static int spe_stats_open(struct inode *inode, struct file *file)
++{
++	return single_open(file, spe_stats_show, inode->i_private);
++}
++
++static const struct file_operations spe_feed_fops = {
++	.write = spe_feed_write,
++};
++
++static const struct file_operations spe_stats_fops = {
++	.open = spe_stats_open,
++	.read = seq_read,
++	.llseek = seq_lseek,
++	.release = single_release,
++};
++
++static int __init damon_spe_dbgfs_init(void)
++{
++	struct dentry *d;
++
++	d = debugfs_create_dir("damon", NULL);
++	if (IS_ERR(d))
++		return PTR_ERR(d);
++	damon_spe_dentry = d;
++
++	debugfs_create_file("spe_feed", 0200, damon_spe_dentry,
++			    NULL, &spe_feed_fops);
++	debugfs_create_file("spe_stats", 0400, damon_spe_dentry,
++			    NULL, &spe_stats_fops);
++
++	pr_info("debugfs interface ready: /sys/kernel/debug/damon/spe_{feed,stats}\n");
++	return 0;
++}
++
++late_initcall(damon_spe_dbgfs_init);
+diff --git a/mm/damon/spe.h b/mm/damon/spe.h
+index 4922f991d734..38799688b5af 100644
+--- a/mm/damon/spe.h
++++ b/mm/damon/spe.h
+@@ -3,8 +3,11 @@
+  * DAMON SPE (Statistical Profiling Extension) feedback
+  *
+  * Provides sub-THP access heatmap for intelligent split decisions.
+- * Prototype: uses PTE access bits on non-SPE hardware.
+- * Production: integrates ARM SPE PMU on supported platforms (e.g. Kunpeng 920).
++ *
++ * Three-phase architecture:
++ *   Phase 2a: PTE access bits via folio_walk (current fallback)
++ *   Phase 2b: Userspace SPE daemon feeds {pfn, subpage} via debugfs
++ *   Phase 2c: Kernel perf_event_create_kernel_counter for ARM SPE
+  *
+  * Copyright (C) 2026 Wang Lian <lianux.mm@gmail.com>
+  */
+@@ -13,43 +16,28 @@
+ #define _DAMON_SPE_H
+ 
+ #include <linux/mm_types.h>
++#include <linux/types.h>
+ 
+ #ifdef CONFIG_DAMON_SPE
+ 
+-/*
+- * damon_spe_folio_heatmap - Get sub-THP access bitmap for a folio
+- * @folio: The folio to query (must be locked or ref'd by caller)
+- * @vma:   VMA containing the folio (for page table walk)
+- * @addr:  Virtual address of the folio
+- * @target_order: Granularity of the bitmap (each bit = one chunk of this order)
+- * @hot_bitmap:   Output bitmap, bit N=1 means Nth chunk was accessed
+- *
+- * Returns: number of bits in the bitmap on success,
+- *          -EOPNOTSUPP if SPE data is not available (caller should fall back
+- *          to unconditional split).
+- *
+- * On hardware with ARM SPE, reads the PMU buffer to determine which sub-pages
+- * within a THP have been accessed.  The bitmap is relative to @target_order:
+- * e.g. for a PMD-order THP (order=9) with target_order=2:
+- *   - The THP has 2^(9-2) = 128 chunks of order-2
+- *   - hot_bitmap has 128 bits, max return value 128
+- *
+- * On hardware without SPE, splits the PMD to PTEs and checks access bits,
+- * but only if the PMD is already split.  Returns -EOPNOTSUPP otherwise.
+- */
++/* ---- Sub-page heatmap query ---- */
++
+ int damon_spe_folio_heatmap(struct folio *folio, struct vm_area_struct *vma,
+ 			    unsigned long addr, unsigned int target_order,
+ 			    unsigned long *hot_bitmap);
+ 
+-/*
+- * damon_spe_hot_fraction - Fraction of chunks that were accessed
+- *
+- * Convenience wrapper: returns the fraction (0..100) of hot chunks.
+- * Returns -EOPNOTSUPP if data unavailable.
+- */
+ int damon_spe_hot_fraction(struct folio *folio, struct vm_area_struct *vma,
+ 			   unsigned long addr, unsigned int target_order);
+ 
++/* ---- Recording (called from SPE event handler or userspace daemon) ---- */
++
++void damon_spe_record_access(unsigned long pfn, pid_t pid);
++
++/* ---- Maintenance ---- */
++
++void damon_spe_prune(void);
++void damon_spe_stats(unsigned int *nr_entries, unsigned long *total_accesses);
++
+ #else /* !CONFIG_DAMON_SPE */
+ 
+ static inline int damon_spe_folio_heatmap(struct folio *folio,
+@@ -66,5 +54,9 @@ static inline int damon_spe_hot_fraction(struct folio *folio,
+ 	return -EOPNOTSUPP;
+ }
+ 
++static inline void damon_spe_record_access(unsigned long pfn, pid_t pid) {}
++static inline void damon_spe_prune(void) {}
++static inline void damon_spe_stats(unsigned int *nr, unsigned long *total) {}
++
+ #endif /* CONFIG_DAMON_SPE */
+ #endif /* _DAMON_SPE_H */
+-- 
+2.50.1 (Apple Git-155)
+

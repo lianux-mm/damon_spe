@@ -1,0 +1,117 @@
+From 532c12db3d513b3412bec020cbec5df64dcdbe9b Mon Sep 17 00:00:00 2001
+From: Wang Lian <lianux.mm@gmail.com>
+Date: Fri, 12 Jun 2026 16:35:27 +0800
+Subject: [RFC PATCH 0/8] DAMON mTHP collapse/split with SPE hot/cold detection
+
+This series adds mTHP collapse and split actions to DAMON, with
+sub-THP access heatmap feedback via ARM SPE for intelligent split
+decisions.
+
+Overview
+========
+
+DAMON currently only monitors access patterns.  This series extends it
+to actively manage transparent hugepages: collapsing smaller mTHPs into
+PMD-sized THPs when beneficial, and splitting PMD THPs into smaller
+mTHPs when only a fraction of the THP is hot.
+
+The split decision uses ARM SPE (Statistical Profiling Extension,
+ARMv8.2+) to track per-subpage access counts within each THP, building
+a heatmap that identifies which subpages are cold and can be split away.
+
+Architecture
+============
+
+Collapse (patches 1-3,7):
+  DAMON scheme with DAMOS_COLLAPSE action + target_order
+  -> damos_va_collapse()
+  -> damon_collapse_folio_range()  [khugepaged wrapper]
+  -> collapse_huge_page()          [existing khugepaged logic]
+
+Split (patches 4-8):
+  DAMON scheme with DAMOS_MTHP_SPLIT action + target_order
+  -> damos_va_mthp_split()
+  -> damon_spe_hot_fraction()       [sub-THP heatmap query]
+  -> split_folio_to_order()         [if cold enough]
+
+SPE feedback (patches 6,8):
+  ARM SPE samples -> {phys_addr, access_type}
+  -> rbtree: {THP-aligned PFN -> count[512]}
+  -> damon_spe_folio_heatmap() -> hot bitmap
+  -> split decision (hot_fraction < threshold)
+
+  Data can be fed into the rbtree via:
+  - Phase 2b: userspace SPE daemon -> debugfs spe_feed (ready)
+  - Phase 2c: kernel perf_event_create_kernel_counter (requires hw)
+
+Test Results
+============
+
+ARM64 VMware VM, kernel 7.1.0-rc5+, 4 CPUs, 4GB RAM:
+
+  Split (PMD THP -> 16KB mTHP):
+    nr_applied=11, sz_applied=70MB
+    AnonHugePages: 67584kB -> 0kB
+    16KB nr_anon: 0 -> 4224
+
+  Collapse (16KB mTHP -> PMD THP):
+    nr_applied=10, sz_applied=66MB
+    AnonHugePages: 0kB -> 67584kB
+    16KB nr_anon: 4224 -> 0
+
+  Full round-trip verified: split then collapse, stats correct.
+  No deadlocks (rwsem issue identified and fixed in patch 7).
+
+  Benchmark (256MB anon random access, 60s, ARM64):
+    DAMON madvise: +43.8% throughput vs baseline, +8.9% vs always-mode
+    Full collapse completes in ~2.5s
+
+Known Issues
+============
+- khugepaged can re-collapse mTHPs that DAMON splits, causing ping-pong
+- SPE sampling precision vs overhead tradeoff not yet measured on
+  hardware (userspace validation pending on Kunpeng 920 server)
+- Without SPE hardware, split falls back to unconditional mode
+  (splits all PMD THPs matching the scheme filter)
+
+Next Steps
+==========
+1. Validate SPE sub-page heatmap accuracy on ARM server (Kunpeng 920)
+2. Add kernel SPE event for direct sampling (Phase 2c)
+3. Implement rate-limiting to prevent split/collapse ping-pong
+4. Optimize SPE sampling period for production workloads
+
+Cc: sj@kernel.org
+Cc: linux-mm@kvack.org
+Signed-off-by: Wang Lian <lianux.mm@gmail.com>
+
+Wang Lian (5):
+  mm/damon: add target_order field for DAMOS_COLLAPSE
+  mm/khugepaged: add damon_collapse_folio_range() for external callers
+  mm/damon/vaddr: implement mTHP-aware DAMOS_COLLAPSE handler
+  mm/damon: introduce DAMOS_MTHP_SPLIT action for mTHP split
+  mm/damon/vaddr: implement DAMOS_MTHP_SPLIT handler
+
+wang lian (3):
+  mm/damon: add SPE feedback prototype for sub-THP split decisions
+  mm/damon: fix collapse rwsem deadlock and sysfs target_order
+    validation
+  mm/damon: upgrade SPE feedback with rbtree histogram and debugfs
+    bridge
+
+ include/linux/damon.h      |   8 +
+ include/linux/khugepaged.h |   3 +
+ mm/damon/Kconfig           |  12 +
+ mm/damon/Makefile          |   1 +
+ mm/damon/core.c            |   3 +
+ mm/damon/spe.c             | 474 +++++++++++++++++++++++++++++++++++++
+ mm/damon/spe.h             |  62 +++++
+ mm/damon/sysfs-schemes.c   |  56 +++++
+ mm/damon/vaddr.c           | 110 +++++++++
+ mm/khugepaged.c            |  37 +++
+ 10 files changed, 766 insertions(+)
+ create mode 100644 mm/damon/spe.c
+ create mode 100644 mm/damon/spe.h
+
+--
+2.50.1 (Apple Git-155)

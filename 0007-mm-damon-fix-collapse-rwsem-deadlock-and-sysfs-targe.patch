@@ -1,0 +1,103 @@
+From 6679692c3da38f1ecedb1aea96c74bdaf07cb5d1 Mon Sep 17 00:00:00 2001
+From: wang lian <lianux.mm@gmail.com>
+Date: Fri, 12 Jun 2026 16:34:11 +0800
+Subject: [RFC PATCH 7/8] mm/damon: fix collapse rwsem deadlock and sysfs
+ target_order validation
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Two fixes from testing:
+
+1. Collapse deadlock: damos_va_collapse() held mmap_read_lock(mm) while
+   calling damon_collapse_folio_range() which internally calls
+   collapse_huge_page().  collapse_huge_page() does mmap_read_lock,
+   mmap_read_unlock, then mmap_write_lock.  The write lock waits for
+   all readers to release, but the reader is the same thread that's
+   trying to acquire the write lock — classic rwsem self-deadlock.
+
+   Fix by removing the outer mmap_read_lock/mm_Read_unlock from
+   damos_va_collapse().  collapse_huge_page() manages its own locking.
+
+2. sysfs target_order: the validation incorrectly required PMD order
+   for both collapse and mthp_split actions.  Split should allow any
+   order < PMD order (e.g. order-2 for 16KB mTHP).  Add separate
+   validation paths.
+
+Verified: split 70MB (PMD→16KB), collapse 66MB (16KB→PMD),
+full round-trip AnonHugePages correct, no deadlock.
+
+Co-Authored-By: Claude Opus 4.7 <noreply@anthropic.com>
+---
+ mm/damon/sysfs-schemes.c | 12 +++++++++---
+ mm/damon/vaddr.c         | 15 +++------------
+ 2 files changed, 12 insertions(+), 15 deletions(-)
+
+diff --git a/mm/damon/sysfs-schemes.c b/mm/damon/sysfs-schemes.c
+index e50555f121cf..7225c77261d1 100644
+--- a/mm/damon/sysfs-schemes.c
++++ b/mm/damon/sysfs-schemes.c
+@@ -3044,15 +3044,21 @@ static struct damos *damon_sysfs_mk_scheme(
+ 	if (!scheme)
+ 		return NULL;
+ 
+-	if ((sysfs_scheme->action == DAMOS_COLLAPSE ||
+-	     sysfs_scheme->action == DAMOS_MTHP_SPLIT) &&
++	if (sysfs_scheme->action == DAMOS_COLLAPSE &&
+ 	    sysfs_scheme->target_order != 0 &&
+ 	    sysfs_scheme->target_order != HPAGE_PMD_ORDER) {
+-		pr_warn("DAMON collapse/split: target_order %u not supported, only PMD order (%u) is available. Use 0 or %u.\n",
++		pr_warn("DAMON collapse: target_order %u not supported, only PMD order (%u) is available. Use 0 or %u.\n",
+ 			sysfs_scheme->target_order,
+ 			HPAGE_PMD_ORDER, HPAGE_PMD_ORDER);
+ 		sysfs_scheme->target_order = 0;
+ 	}
++	if (sysfs_scheme->action == DAMOS_MTHP_SPLIT &&
++	    sysfs_scheme->target_order >= HPAGE_PMD_ORDER) {
++		pr_warn("DAMON mthp_split: target_order %u must be less than PMD order (%u). Resetting to 0.\n",
++			sysfs_scheme->target_order,
++			HPAGE_PMD_ORDER);
++		sysfs_scheme->target_order = 0;
++	}
+ 	scheme->target_order = sysfs_scheme->target_order;
+ 
+ 	err = damos_sysfs_add_quota_score(sysfs_quotas->goals, &scheme->quota);
+diff --git a/mm/damon/vaddr.c b/mm/damon/vaddr.c
+index 8df827007093..b4f7261aa377 100644
+--- a/mm/damon/vaddr.c
++++ b/mm/damon/vaddr.c
+@@ -923,9 +923,7 @@ static unsigned long damos_va_collapse(struct damon_target *target,
+ 		return 0;
+ 
+ 	while (addr < end) {
+-		mmap_read_lock(mm);
+ 		ret = damon_collapse_folio_range(mm, addr, target_order);
+-		mmap_read_unlock(mm);
+ 		if (!ret)
+ 			applied += chunk_sz;
+ 		*sz_filter_passed += chunk_sz;
+@@ -976,18 +974,11 @@ static unsigned long damos_va_mthp_split(struct damon_target *target,
+ 			folio_get(folio);
+ 			folio_walk_end(&fw, vma);
+ 
+-			/*
+-			 * Query sub-THP access hotness.  On SPE-capable
+-			 * hardware this reads PMU samples; the prototype
+-			 * checks PTE access bits.  Returns -EOPNOTSUPP
+-			 * when data is unavailable (split unconditionally).
+-			 */
+ 			hot_pct = damon_spe_hot_fraction(folio, vma, addr,
+ 							 target_order);
+-			if (hot_pct < 80) {
+-				if (!split_folio_to_order(folio, target_order))
+-					applied += chunk_sz;
+-			}
++			if (hot_pct < 80 &&
++			    !split_folio_to_order(folio, target_order))
++				applied += chunk_sz;
+ 
+ 			folio_unlock(folio);
+ 			folio_put(folio);
+-- 
+2.50.1 (Apple Git-155)
+
