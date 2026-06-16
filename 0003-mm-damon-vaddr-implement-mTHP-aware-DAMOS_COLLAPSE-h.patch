@@ -1,15 +1,14 @@
-From 9d47f207acd7925191fba06ffe28a8c02276b74b Mon Sep 17 00:00:00 2001
+From 097fe193bbd72324ae3695015631c200a1772f04 Mon Sep 17 00:00:00 2001
 From: Wang Lian <lianux.mm@gmail.com>
 Date: Thu, 11 Jun 2026 14:28:44 +0800
-Subject: [RFC PATCH 3/8] mm/damon/vaddr: implement mTHP-aware DAMOS_COLLAPSE
+Subject: [PATCH 3/6] mm/damon/vaddr: implement mTHP-aware DAMOS_COLLAPSE
  handler
 
-When target_order is set (non-zero), the DAMOS_COLLAPSE handler now
-calls damon_collapse_folio_range() to collapse pages into the
-requested mTHP size, iterating over the target region in
-order-aligned chunks.  When target_order is 0 (default), the existing
-madvise(MADV_COLLAPSE) path is used, preserving backwards
-compatibility.
+When target_order is set (non-zero), the DAMOS_COLLAPSE handler now calls
+damon_collapse_folio_range() to collapse pages into the requested mTHP
+size, iterating over the target region in order-aligned chunks.  When
+target_order is 0 (default), the existing madvise(MADV_COLLAPSE) path is
+used, preserving backwards compatibility.
 
 Region boundaries are expanded outward to the covering aligned range
 (ALIGN_DOWN start, ALIGN end) so that collapse works even after
@@ -17,18 +16,21 @@ kdamond_split_regions reduces region sizes below the chunk size.
 collapse_huge_page() internally validates VMA bounds, so expanding
 beyond the original region is safe.
 
-The mmap read lock is acquired per chunk, matching the lock pattern
-used by madvise_collapse().
+No external mmap lock is held: collapse_huge_page() acquires
+mmap_read_lock internally for validation, releases it, then acquires
+mmap_write_lock for the actual collapse.  Holding an outer
+mmap_read_lock would cause a self-deadlock when the same thread
+attempts the inner mmap_write_lock.
 
 Co-developed-by: Kunwu Chan <kunwu.chan@gmail.com>
 Signed-off-by: Kunwu Chan <kunwu.chan@gmail.com>
 Signed-off-by: Wang Lian <lianux.mm@gmail.com>
 ---
- mm/damon/vaddr.c | 40 ++++++++++++++++++++++++++++++++++++++++
- 1 file changed, 40 insertions(+)
+ mm/damon/vaddr.c | 38 ++++++++++++++++++++++++++++++++++++++
+ 1 file changed, 38 insertions(+)
 
 diff --git a/mm/damon/vaddr.c b/mm/damon/vaddr.c
-index d27147603564..5cbfb6d4af2e 100644
+index d27147603564..2a3757c13bf0 100644
 --- a/mm/damon/vaddr.c
 +++ b/mm/damon/vaddr.c
 @@ -14,6 +14,7 @@
@@ -39,7 +41,7 @@ index d27147603564..5cbfb6d4af2e 100644
  
  #include "../internal.h"
  #include "ops-common.h"
-@@ -899,6 +900,42 @@ static unsigned long damos_va_stat(struct damon_target *target,
+@@ -899,6 +900,40 @@ static unsigned long damos_va_stat(struct damon_target *target,
  	return 0;
  }
  
@@ -65,9 +67,7 @@ index d27147603564..5cbfb6d4af2e 100644
 +		return 0;
 +
 +	while (addr < end) {
-+		mmap_read_lock(mm);
 +		ret = damon_collapse_folio_range(mm, addr, target_order);
-+		mmap_read_unlock(mm);
 +		if (!ret)
 +			applied += chunk_sz;
 +		*sz_filter_passed += chunk_sz;
@@ -82,7 +82,7 @@ index d27147603564..5cbfb6d4af2e 100644
  static unsigned long damon_va_apply_scheme(struct damon_ctx *ctx,
  		struct damon_target *t, struct damon_region *r,
  		struct damos *scheme, unsigned long *sz_filter_passed)
-@@ -922,6 +959,9 @@ static unsigned long damon_va_apply_scheme(struct damon_ctx *ctx,
+@@ -922,6 +957,9 @@ static unsigned long damon_va_apply_scheme(struct damon_ctx *ctx,
  		madv_action = MADV_NOHUGEPAGE;
  		break;
  	case DAMOS_COLLAPSE:
