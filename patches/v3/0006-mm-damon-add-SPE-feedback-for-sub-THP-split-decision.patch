@@ -1,4 +1,4 @@
-From 15db0621aa2fea9d0e5f17d1609e8ee157a53c8b Mon Sep 17 00:00:00 2001
+From 6a20aea1301201eb96a6ccf12d9efdc785fdabf3 Mon Sep 17 00:00:00 2001
 From: Wang Lian <lianux.mm@gmail.com>
 Date: Tue, 16 Jun 2026 13:41:32 +0800
 Subject: [PATCH 6/6] mm/damon: add SPE feedback for sub-THP split decisions
@@ -664,7 +664,7 @@ index 000000000000..38799688b5af
 +#endif /* CONFIG_DAMON_SPE */
 +#endif /* _DAMON_SPE_H */
 diff --git a/mm/damon/vaddr.c b/mm/damon/vaddr.c
-index 94ca1cbde194..2b8c65b4c674 100644
+index 9da9c34c9175..2a57a9394a6a 100644
 --- a/mm/damon/vaddr.c
 +++ b/mm/damon/vaddr.c
 @@ -18,6 +18,7 @@
@@ -683,7 +683,7 @@ index 94ca1cbde194..2b8c65b4c674 100644
  
  	mm = damon_get_mm(target);
  	if (!mm)
-@@ -972,7 +974,10 @@ static unsigned long damos_va_mthp_split(struct damon_target *target,
+@@ -979,7 +981,10 @@ static unsigned long damos_va_mthp_split(struct damon_target *target,
  			folio_get(folio);
  			folio_walk_end(&fw, vma);
  

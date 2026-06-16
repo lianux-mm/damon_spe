@@ -1,4 +1,4 @@
-From c20f6f0b4c9d0b5943ed6a16ad8047fc0273dde7 Mon Sep 17 00:00:00 2001
+From 178beda157f7ca8b1bc316a925fb2b2da302c655 Mon Sep 17 00:00:00 2001
 From: Wang Lian <lianux.mm@gmail.com>
 Date: Thu, 11 Jun 2026 14:31:52 +0800
 Subject: [PATCH 4/6] mm/damon: introduce DAMOS_MTHP_SPLIT action for mTHP
@@ -9,19 +9,27 @@ specified target_order.  The target_order field of struct damos,
 introduced for DAMOS_COLLAPSE, is reused for SPLIT.
 
 For COLLAPSE, only PMD order (HPAGE_PMD_ORDER) is supported since
-collapse_huge_page() requires it.  For MTHP_SPLIT, any target_order
-less than PMD order is accepted, allowing splits to e.g. order-2
-(16KB) or order-3 (32KB) mTHP.
+collapse_huge_page() requires it.  For MTHP_SPLIT, valid target_order
+is 2..HPAGE_PMD_ORDER-1, allowing splits to e.g. order-2 (16KB) or
+order-3 (32KB) mTHP.  An invalid value (0 or >= PMD_ORDER) defaults
+to order-2; 0 would mean "split to base page" which defeats the
+purpose of mTHP split.
 
-The actual split implementation will follow in subsequent patches.
+target_order is a single field shared by COLLAPSE and MTHP_SPLIT.
+While their semantics differ (collapse source order vs split
+destination order), they are never set simultaneously on the same
+scheme, so the shared field avoids bloating struct damos.  The
+sysfs mk_scheme() validation enforces the per-action constraints.
+
+The actual split implementation follows in subsequent patches.
 
 Co-developed-by: Kunwu Chan <kunwu.chan@gmail.com>
 Signed-off-by: Kunwu Chan <kunwu.chan@gmail.com>
 Signed-off-by: Wang Lian <lianux.mm@gmail.com>
 ---
  include/linux/damon.h    |  7 +++++--
- mm/damon/sysfs-schemes.c | 11 +++++++++++
- 2 files changed, 16 insertions(+), 2 deletions(-)
+ mm/damon/sysfs-schemes.c | 12 ++++++++++++
+ 2 files changed, 17 insertions(+), 2 deletions(-)
 
 diff --git a/include/linux/damon.h b/include/linux/damon.h
 index 5a0587556573..9345b276021c 100644
@@ -56,7 +64,7 @@ index 5a0587556573..9345b276021c 100644
  	unsigned int target_order;
  	unsigned long apply_interval_us;
 diff --git a/mm/damon/sysfs-schemes.c b/mm/damon/sysfs-schemes.c
-index 735970717048..7225c77261d1 100644
+index 735970717048..37585a18f845 100644
 --- a/mm/damon/sysfs-schemes.c
 +++ b/mm/damon/sysfs-schemes.c
 @@ -2293,6 +2293,10 @@ static struct damos_sysfs_action_name damos_sysfs_action_names[] = {
@@ -70,16 +78,17 @@ index 735970717048..7225c77261d1 100644
  	{
  		.action = DAMOS_LRU_PRIO,
  		.name = "lru_prio",
-@@ -3048,6 +3052,13 @@ static struct damos *damon_sysfs_mk_scheme(
+@@ -3048,6 +3052,14 @@ static struct damos *damon_sysfs_mk_scheme(
  			HPAGE_PMD_ORDER, HPAGE_PMD_ORDER);
  		sysfs_scheme->target_order = 0;
  	}
 +	if (sysfs_scheme->action == DAMOS_MTHP_SPLIT &&
-+	    sysfs_scheme->target_order >= HPAGE_PMD_ORDER) {
-+		pr_warn("DAMON mthp_split: target_order %u must be less than PMD order (%u). Resetting to 0.\n",
++	    (sysfs_scheme->target_order == 0 ||
++	     sysfs_scheme->target_order >= HPAGE_PMD_ORDER)) {
++		pr_warn("DAMON mthp_split: target_order %u invalid, need 2..%u. Defaulting to 2.\n",
 +			sysfs_scheme->target_order,
-+			HPAGE_PMD_ORDER);
-+		sysfs_scheme->target_order = 0;
++			HPAGE_PMD_ORDER - 1);
++		sysfs_scheme->target_order = 2;
 +	}
  	scheme->target_order = sysfs_scheme->target_order;
  

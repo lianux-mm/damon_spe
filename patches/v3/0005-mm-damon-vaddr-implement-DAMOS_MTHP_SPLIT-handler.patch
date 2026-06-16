@@ -1,4 +1,4 @@
-From 59d4e7589cbb7da7a1ce82ed730f175f7797ec8c Mon Sep 17 00:00:00 2001
+From 8df9930da7a232d1088b3ea12e2dc5fe47b803ab Mon Sep 17 00:00:00 2001
 From: Wang Lian <lianux.mm@gmail.com>
 Date: Thu, 11 Jun 2026 14:32:00 +0800
 Subject: [PATCH 5/6] mm/damon/vaddr: implement DAMOS_MTHP_SPLIT handler
@@ -8,21 +8,29 @@ Walk the region in PMD-sized aligned chunks, use folio_walk_start() to
 locate THP folios, and call split_folio_to_order() when the folio order
 exceeds the target_order.
 
-The implementation follows the same mmap_read_lock-per-chunk pattern as
-damos_va_collapse().
+Unlike COLLAPSE which is limited to anonymous memory via
+collapse_huge_page(), split_folio_to_order() supports both anon and
+shmem folios.  This is critical for tmpfs THP-backed KVM guest memory,
+where cold and hot pages bundled together in a single PMD THP cause
+DAMON to overestimate hot regions.
+
+The handler holds mmap_read_lock per chunk for VMA lookup and
+folio_walk_start(), then releases it before the next iteration.
+split_folio_to_order() does not reacquire mmap locks internally,
+so this pattern is safe.
 
 Co-developed-by: Kunwu Chan <kunwu.chan@gmail.com>
 Signed-off-by: Kunwu Chan <kunwu.chan@gmail.com>
 Signed-off-by: Wang Lian <lianux.mm@gmail.com>
 ---
- mm/damon/vaddr.c | 67 ++++++++++++++++++++++++++++++++++++++++++++++++
- 1 file changed, 67 insertions(+)
+ mm/damon/vaddr.c | 74 ++++++++++++++++++++++++++++++++++++++++++++++++
+ 1 file changed, 74 insertions(+)
 
 diff --git a/mm/damon/vaddr.c b/mm/damon/vaddr.c
-index 2a3757c13bf0..94ca1cbde194 100644
+index 2a3757c13bf0..9da9c34c9175 100644
 --- a/mm/damon/vaddr.c
 +++ b/mm/damon/vaddr.c
-@@ -934,6 +934,70 @@ static unsigned long damos_va_collapse(struct damon_target *target,
+@@ -934,6 +934,77 @@ static unsigned long damos_va_collapse(struct damon_target *target,
  	return applied;
  }
  
@@ -49,7 +57,14 @@ index 2a3757c13bf0..94ca1cbde194 100644
 +	while (addr < end) {
 +		mmap_read_lock(mm);
 +		vma = find_vma(mm, addr);
-+		if (!vma || !vma_is_anonymous(vma) || addr < vma->vm_start)
++		/*
++		 * split_folio_to_order() supports both anon and shmem
++		 * folios, so we accept any VMA that has a folio at @addr.
++		 * This covers important use cases like tmpfs THP-backed
++		 * KVM guest memory where cold and hot pages are bundled
++		 * together in a single PMD THP.
++		 */
++		if (!vma || addr < vma->vm_start)
 +			goto next;
 +
 +		folio = folio_walk_start(&fw, vma, addr, 0);
@@ -93,7 +108,7 @@ index 2a3757c13bf0..94ca1cbde194 100644
  static unsigned long damon_va_apply_scheme(struct damon_ctx *ctx,
  		struct damon_target *t, struct damon_region *r,
  		struct damos *scheme, unsigned long *sz_filter_passed)
-@@ -967,6 +1031,9 @@ static unsigned long damon_va_apply_scheme(struct damon_ctx *ctx,
+@@ -967,6 +1038,9 @@ static unsigned long damon_va_apply_scheme(struct damon_ctx *ctx,
  		return damos_va_migrate(t, r, scheme, sz_filter_passed);
  	case DAMOS_STAT:
  		return damos_va_stat(t, r, scheme, sz_filter_passed);
