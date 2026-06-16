@@ -9,20 +9,19 @@ from Huawei) by adding a target_order field, and introduces a new
 DAMOS_MTHP_SPLIT action with ARM SPE-based hot/cold detection.
 
 Background
-----------
 DAMON provides data access monitoring but lacks proactive huge page
 management.  khugepaged operates blindly (always try to collapse) and
-has no split capability.  This series gives DAMON the ability to:
+has no split capability.  
 
-- Collapse small mTHPs (e.g. 16KB) back to PMD THPs (2MB) in hot
+This series gives DAMON the ability to:
+1: Collapse small mTHPs (e.g. 16KB) back to PMD THPs (2MB) in hot
   regions identified by DAMON's access pattern monitoring.
 
-- Split cold PMD THPs into smaller mTHPs, preserving only the hot
+2: Split cold PMD THPs into smaller mTHPs, preserving only the hot
   subpages at the target order, reducing memory waste from partially
   hot THPs.
 
 Architecture
-------------
 DAMON monitoring -> scheme filter -> COLLAPSE/SPLIT action
 
   damos_va_collapse()                damos_va_mthp_split()
