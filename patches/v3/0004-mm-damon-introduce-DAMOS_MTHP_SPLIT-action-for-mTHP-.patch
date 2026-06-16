@@ -1,0 +1,89 @@
+From c20f6f0b4c9d0b5943ed6a16ad8047fc0273dde7 Mon Sep 17 00:00:00 2001
+From: Wang Lian <lianux.mm@gmail.com>
+Date: Thu, 11 Jun 2026 14:31:52 +0800
+Subject: [PATCH 4/6] mm/damon: introduce DAMOS_MTHP_SPLIT action for mTHP
+ split
+
+Add a new DAMOS_MTHP_SPLIT action to split a large folio to the
+specified target_order.  The target_order field of struct damos,
+introduced for DAMOS_COLLAPSE, is reused for SPLIT.
+
+For COLLAPSE, only PMD order (HPAGE_PMD_ORDER) is supported since
+collapse_huge_page() requires it.  For MTHP_SPLIT, any target_order
+less than PMD order is accepted, allowing splits to e.g. order-2
+(16KB) or order-3 (32KB) mTHP.
+
+The actual split implementation will follow in subsequent patches.
+
+Co-developed-by: Kunwu Chan <kunwu.chan@gmail.com>
+Signed-off-by: Kunwu Chan <kunwu.chan@gmail.com>
+Signed-off-by: Wang Lian <lianux.mm@gmail.com>
+---
+ include/linux/damon.h    |  7 +++++--
+ mm/damon/sysfs-schemes.c | 11 +++++++++++
+ 2 files changed, 16 insertions(+), 2 deletions(-)
+
+diff --git a/include/linux/damon.h b/include/linux/damon.h
+index 5a0587556573..9345b276021c 100644
+--- a/include/linux/damon.h
++++ b/include/linux/damon.h
+@@ -121,6 +121,7 @@ struct damon_target {
+  * @DAMOS_HUGEPAGE:	Call ``madvise()`` for the region with MADV_HUGEPAGE.
+  * @DAMOS_NOHUGEPAGE:	Call ``madvise()`` for the region with MADV_NOHUGEPAGE.
+  * @DAMOS_COLLAPSE:	Call ``madvise()`` for the region with MADV_COLLAPSE.
++ * @DAMOS_MTHP_SPLIT:	Split large folios to the target mTHP order.
+  * @DAMOS_LRU_PRIO:	Prioritize the region on its LRU lists.
+  * @DAMOS_LRU_DEPRIO:	Deprioritize the region on its LRU lists.
+  * @DAMOS_MIGRATE_HOT:  Migrate the regions prioritizing warmer regions.
+@@ -141,6 +142,7 @@ enum damos_action {
+ 	DAMOS_HUGEPAGE,
+ 	DAMOS_NOHUGEPAGE,
+ 	DAMOS_COLLAPSE,
++	DAMOS_MTHP_SPLIT,
+ 	DAMOS_LRU_PRIO,
+ 	DAMOS_LRU_DEPRIO,
+ 	DAMOS_MIGRATE_HOT,
+@@ -573,8 +575,9 @@ struct damos {
+ 	struct damos_access_pattern pattern;
+ 	enum damos_action action;
+ 	/*
+-	 * @target_order: target order for mTHP actions (DAMOS_COLLAPSE).
+-	 * 0 means system default (PMD order).  Valid: 0, 2..HPAGE_PMD_ORDER.
++	 * @target_order: target mTHP order for DAMOS_COLLAPSE and
++	 * DAMOS_MTHP_SPLIT.  0 means system default (PMD order).
++	 * Valid: 0, 2..HPAGE_PMD_ORDER.
+ 	 */
+ 	unsigned int target_order;
+ 	unsigned long apply_interval_us;
+diff --git a/mm/damon/sysfs-schemes.c b/mm/damon/sysfs-schemes.c
+index 735970717048..7225c77261d1 100644
+--- a/mm/damon/sysfs-schemes.c
++++ b/mm/damon/sysfs-schemes.c
+@@ -2293,6 +2293,10 @@ static struct damos_sysfs_action_name damos_sysfs_action_names[] = {
+ 		.action = DAMOS_COLLAPSE,
+ 		.name = "collapse",
+ 	},
++	{
++		.action = DAMOS_MTHP_SPLIT,
++		.name = "mthp_split",
++	},
+ 	{
+ 		.action = DAMOS_LRU_PRIO,
+ 		.name = "lru_prio",
+@@ -3048,6 +3052,13 @@ static struct damos *damon_sysfs_mk_scheme(
+ 			HPAGE_PMD_ORDER, HPAGE_PMD_ORDER);
+ 		sysfs_scheme->target_order = 0;
+ 	}
++	if (sysfs_scheme->action == DAMOS_MTHP_SPLIT &&
++	    sysfs_scheme->target_order >= HPAGE_PMD_ORDER) {
++		pr_warn("DAMON mthp_split: target_order %u must be less than PMD order (%u). Resetting to 0.\n",
++			sysfs_scheme->target_order,
++			HPAGE_PMD_ORDER);
++		sysfs_scheme->target_order = 0;
++	}
+ 	scheme->target_order = sysfs_scheme->target_order;
+ 
+ 	err = damos_sysfs_add_quota_score(sysfs_quotas->goals, &scheme->quota);
+-- 
+2.50.1 (Apple Git-155)
+
