@@ -74,75 +74,54 @@ static struct thp_entry *find_or_create(unsigned long pa)
  * We need phys_addr and event (LOAD/STORE/BRANCH/etc.) */
 static void process_line(char *line)
 {
-	char *save, *tok, *phys_str = NULL, *event_str = NULL;
-	int field = 0;
-	unsigned long phys_addr;
+        char *save, *tok;
+        char *phys_str = NULL;
+        char *event_str = NULL;
 
-	/* perf script -F outputs tab-separated fields; first line is header */
-	if (line[0] == ' ' || line[0] == '\t' || strstr(line, "phys_addr"))
-		return;
+        if (strstr(line, "Samples for") || line[0] == '#')
+                return;
 
-	tok = strtok_r(line, "\t\n", &save);
-	while (tok) {
-		/* Try to parse as hex phys_addr */
-		if (tok[0] == '0' && tok[1] == 'x') {
-			char *end;
-			unsigned long v = strtoul(tok, &end, 16);
-			/* phys_addr is typically large (40+ bits) */
-			if (v > 0x1000 && !phys_str && end && *end == '\0')
-				phys_str = tok;
-		}
-		/* event field: LS, LD, ST, B, etc. */
-		if (tok[0] == 'L' && (tok[1] == 'D' || tok[1] == 'S' || tok[1] == 'O'))
-			event_str = tok;
-		if (!strcmp(tok, "STORE") || !strcmp(tok, "LOAD"))
-			event_str = tok;
+        total_records++;
 
-		tok = strtok_r(NULL, "\t\n", &save);
-		field++;
-	}
+        tok = strtok_r(line, " \t\n", &save);
+        while (tok) {
+                if (strstr(tok, "arm_spe_0")) {
+                        event_str = tok;
+                }
 
-	/* Alternative parsing: if fields are named, try to find phys_addr= */
-	if (!phys_str) {
-		char *p = strstr(line, "phys_addr");
-		if (p) {
-			p = strchr(p, ' ');
-			if (!p) p = strchr(line, '\t');
-			if (p)
-				phys_str = strdup(p + 1); /* leak ok in prototype */
-		}
-	}
+                char *end;
+                unsigned long v = strtoul(tok, &end, 16);
 
-	total_records++;
+                if (end != tok && *end == '\0' && v > 0) {
+                        phys_str = tok;
+                }
 
-	if (!phys_str) {
-		skipped_no_pa++;
-		return;
-	}
+                tok = strtok_r(NULL, " \t\n", &save);
+        }
 
-	phys_addr = strtoul(phys_str, NULL, 16);
-	if (!phys_addr) {
-		skipped_no_pa++;
-		return;
-	}
+        if (!phys_str) {
+                skipped_no_pa++;
+                return;
+        }
 
-	{
-		struct thp_entry *e = find_or_create(phys_addr);
-		unsigned long pfn = phys_addr >> PAGE_SHIFT;
-		unsigned int idx = pfn & (PMD_PAGES - 1);
+        unsigned long phys_addr = strtoul(phys_str, NULL, 16);
 
-		if (!e)
-			return;
+        struct thp_entry *e = find_or_create(phys_addr);
+        if (!e)
+                return;
 
-		e->counts[idx]++;
-		e->total++;
-		if (event_str) {
-			if (strstr(event_str, "S") || strstr(event_str, "STORE"))
-				e->stores++;
-			else if (strstr(event_str, "L") || strstr(event_str, "LOAD"))
-				e->loads++;
-		}
-	}
+        unsigned long pfn = phys_addr >> PAGE_SHIFT;
+        unsigned int idx = pfn & (PMD_PAGES - 1);
+
+        e->counts[idx]++;
+        e->total++;
+
+        if (event_str) {
+                if (strcasestr(event_str, "store") || strcasestr(event_str, "st"))
+                        e->stores++;
+                else if (strcasestr(event_str, "load") || strcasestr(event_str, "ld"))
+                        e->loads++;
+        }
 }
 
 /* Compare function for sorting THPs by total access count */
