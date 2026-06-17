@@ -1,6 +1,6 @@
-From 3bb6e1c3f24ed81ea2c32b13bf6ba8054a865117 Mon Sep 17 00:00:00 2001
+From c6bd6f8689afae675763308ce16a965ba928d2ab Mon Sep 17 00:00:00 2001
 From: Wang Lian <lianux.mm@gmail.com>
-Date: Wed, 17 Jun 2026 17:06:52 +0800
+Date: Wed, 17 Jun 2026 17:39:48 +0800
 Subject: [RFC PATCH v3 0/6] mm/damon: add mTHP collapse and split control
 MIME-Version: 1.0
 Content-Type: text/plain; charset=UTF-8
@@ -24,9 +24,9 @@ Data-driven design (ARM SPE on Kunpeng 920)
 --------------------------------------------
 Real profiling data drives the split threshold and signal filter:
 
-  - 97% of THPs have <10% hot subpages → clearly cold, split them
-  - 1-2% have 10-30% → borderline, tunable via hot_threshold
-  - <1% have >30% → genuinely hot, preserve
+  - 97% of THPs have <10% hot subpages -> clearly cold, split them
+  - 1-2% have 10-30% -> borderline, tunable via hot_threshold
+  - <1% have >30% -> genuinely hot, preserve
 
   Signal vs noise: raw SPE samples show scattered 1-2 hits across many
   subpages.  The heatmap uses a two-pass signal threshold (>= 1/10 of
@@ -36,9 +36,9 @@ Architecture
 ------------
 
   damos_va_collapse()                damos_va_mthp_split()
-  → damon_collapse_folio_range()    → damon_spe_hot_fraction()
-  → collapse_huge_page()            → hot_pct < hot_threshold?
-       [anon only]                      → split_folio_to_order()
+  -> damon_collapse_folio_range()    -> damon_spe_hot_fraction()
+  -> collapse_huge_page()            -> hot_pct < hot_threshold?
+       [anon only]                      -> split_folio_to_order()
                                          [anon + shmem]
 
 Collapse (patches 1-3):
@@ -48,12 +48,17 @@ Collapse (patches 1-3):
 Split (patches 4-6):
   New DAMOS_MTHP_SPLIT action with configurable hot_threshold (default
   30%, sysfs-tunable).  split_folio_to_order() supports both anon and
-  shmem folios — critical for tmpfs/KVM scenarios.
+  shmem folios -- critical for tmpfs/KVM scenarios.
+
+  When SPE heatmap data is unavailable (no CONFIG_DAMON_SPE, or
+  PMD-mapped THPs without PTE access bits), the handler splits
+  unconditionally -- DAMON access pattern filtering has already
+  identified the region as cold.
 
 SPE Feedback (patch 6, three-phase):
-  Phase 2a — PTE access bits via folio_walk (fallback).
-  Phase 2b — Userspace SPE daemon → debugfs → kernel rbtree (ready).
-  Phase 2c — Kernel-native ARM SPE event handler (future).
+  Phase 2a -- PTE access bits via folio_walk (fallback).
+  Phase 2b -- Userspace SPE daemon -> debugfs -> kernel rbtree (ready).
+  Phase 2c -- Kernel-native ARM SPE event handler (future).
 
 sysfs interface:
   /sys/kernel/mm/damon/admin/kdamonds/.../schemes/0/target_order
@@ -61,9 +66,11 @@ sysfs interface:
 
 Test Results (ARM64 VM, 256MB anon, 60s)
 ----------------------------------------
-Collapse: nr_applied=10  sz_applied=69206016  AnonHugePages→67584kB
-Split:    nr_applied=11  sz_applied=73400320  AnonHugePages→0kB (16KB mTHP)
-Round-trip: AnonHugePages 67584→0→67584
+Collapse: nr_applied=10  sz_applied=69206016  AnonHugePages->67584kB
+Split:    nr_applied=11  sz_applied=73400320  AnonHugePages->0kB (16KB mTHP)
+Round-trip: AnonHugePages 67584->0->67584
+
+Compilation: gcc 15.2.0, ARM64 native, zero warnings.
 
 Known limitations
 -----------------
@@ -88,9 +95,9 @@ Wang Lian (6):
  mm/damon/spe.c             | 499 +++++++++++++++++++++++++++++++++++++
  mm/damon/spe.h             |  62 +++++
  mm/damon/sysfs-schemes.c   |  96 +++++++
- mm/damon/vaddr.c           | 117 +++++++++
+ mm/damon/vaddr.c           | 124 +++++++++
  mm/khugepaged.c            |  39 +++
- 10 files changed, 850 insertions(+)
+ 10 files changed, 857 insertions(+)
  create mode 100644 mm/damon/spe.c
  create mode 100644 mm/damon/spe.h
 
