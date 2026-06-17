@@ -11,22 +11,20 @@ access patterns.  Collapse (patches 1-3) is ready; split (patches 4-6)
 is RFC-stage for community design discussion.
 
 Background
-----------
 DAMON provides data access monitoring but lacks proactive huge page
 management.  khugepaged operates blindly (always collapse) and has no
-split capability.  This series gives DAMON the ability to:
+split capability.
 
-- Collapse small mTHPs back to PMD THPs in hot regions.
-- Split cold PMD THPs into smaller mTHPs, reducing memory waste from
+This series gives DAMON the ability to:
+1. Collapse small mTHPs back to PMD THPs in hot regions.
+2. Split cold PMD THPs into smaller mTHPs, reducing memory waste from
   partially-hot THPs.  Critical for tmpfs THP-backed KVM guest memory.
 
 Data-driven design (ARM SPE on Kunpeng 920)
---------------------------------------------
 Real profiling data drives the split threshold and signal filter:
-
-  - 97% of THPs have <10% hot subpages -> clearly cold, split them
-  - 1-2% have 10-30% -> borderline, tunable via hot_threshold
-  - <1% have >30% -> genuinely hot, preserve
+  1. 97% of THPs have <10% hot subpages -> clearly cold, split them
+  2. 1-2% have 10-30% -> borderline, tunable via hot_threshold
+  3. <1% have >30% -> genuinely hot, preserve
 
   Signal vs noise: raw SPE samples show scattered 1-2 hits across many
   subpages.  The heatmap uses a two-pass signal threshold (>= 1/10 of
@@ -73,7 +71,6 @@ Round-trip: AnonHugePages 67584->0->67584
 Compilation: gcc 15.2.0, ARM64 native, zero warnings.
 
 Known limitations
------------------
 - Collapse limited to anon; khugepaged mTHP support pending upstream.
 - SPE hardware required for hot/cold detection; unconditional split
   without it.
