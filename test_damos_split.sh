@@ -135,6 +135,10 @@ run_damon() {
 	echo on > $DAMON/kdamonds/0/state || die "failed to start DAMON"
 	info "DAMON running, waiting 10s for scheme to fire..."
 	sleep 10
+	# Sync stats from running context to sysfs before stopping.
+	# Without this, sz_tried/sz_applied read as 0 even though
+	# DAMON applied the scheme correctly.
+	echo update_schemes_stats > $DAMON/kdamonds/0/state
 	echo off > $DAMON/kdamonds/0/state
 	info "DAMON stopped"
 }
