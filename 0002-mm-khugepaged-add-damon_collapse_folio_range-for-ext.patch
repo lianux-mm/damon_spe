@@ -1,7 +1,7 @@
-From c2153b48f1a2bafc2d5beac830b4b6b37a9c2980 Mon Sep 17 00:00:00 2001
+From acb9a7194e6e8c931ca73e70f47f2926c7fce31f Mon Sep 17 00:00:00 2001
 From: Wang Lian <lianux.mm@gmail.com>
 Date: Thu, 11 Jun 2026 14:28:36 +0800
-Subject: [PATCH 2/6] mm/khugepaged: add damon_collapse_folio_range() for
+Subject: [PATCH v2 2/5] mm/khugepaged: add damon_collapse_folio_range() for
  external callers
 
 Export a thin wrapper around collapse_huge_page() that allows external

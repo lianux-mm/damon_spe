@@ -1,7 +1,7 @@
-From 097fe193bbd72324ae3695015631c200a1772f04 Mon Sep 17 00:00:00 2001
+From 969637ab5e0d55165f5e05513c50b5f34ddedbe3 Mon Sep 17 00:00:00 2001
 From: Wang Lian <lianux.mm@gmail.com>
 Date: Thu, 11 Jun 2026 14:28:44 +0800
-Subject: [PATCH 3/6] mm/damon/vaddr: implement mTHP-aware DAMOS_COLLAPSE
+Subject: [PATCH v2 3/5] mm/damon/vaddr: implement mTHP-aware DAMOS_COLLAPSE
  handler
 
 When target_order is set (non-zero), the DAMOS_COLLAPSE handler now calls

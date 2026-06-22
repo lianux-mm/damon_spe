@@ -1,105 +1,24 @@
-From c6bd6f8689afae675763308ce16a965ba928d2ab Mon Sep 17 00:00:00 2001
-From: Wang Lian <lianux.mm@gmail.com>
-Date: Wed, 17 Jun 2026 17:39:48 +0800
-Subject: [RFC PATCH v3 0/6] mm/damon: add mTHP collapse and split control
-MIME-Version: 1.0
-Content-Type: text/plain; charset=UTF-8
-Content-Transfer-Encoding: 8bit
+From 9f1e36bea77e56370a9b1c59437a284df8f32389 Mon Sep 17 00:00:00 2001
+From: wang lian <lianux.mm@gmail.com>
+Date: Mon, 22 Jun 2026 13:17:08 +0800
+Subject: [PATCH v2 0/5] *** SUBJECT HERE ***
 
-This series extends DAMON with mTHP collapse and split control based on
-access patterns.  Collapse (patches 1-3) is ready; split (patches 4-6)
-is RFC-stage for community design discussion.
+*** BLURB HERE ***
 
-Background
-DAMON provides data access monitoring but lacks proactive huge page
-management.  khugepaged operates blindly (always collapse) and has no
-split capability.
-
-This series gives DAMON the ability to:
-1. Collapse small mTHPs back to PMD THPs in hot regions.
-2. Split cold PMD THPs into smaller mTHPs, reducing memory waste from
-  partially-hot THPs.  Critical for tmpfs THP-backed KVM guest memory.
-
-Data-driven design (ARM SPE on Kunpeng 920)
-Real profiling data drives the split threshold and signal filter:
-  1. 97% of THPs have <10% hot subpages -> clearly cold, split them
-  2. 1-2% have 10-30% -> borderline, tunable via hot_threshold
-  3. <1% have >30% -> genuinely hot, preserve
-
-  Signal vs noise: raw SPE samples show scattered 1-2 hits across many
-  subpages.  The heatmap uses a two-pass signal threshold (>= 1/10 of
-  peak chunk access count) to filter noise before computing hot fraction.
-
-Architecture
-------------
-
-  damos_va_collapse()                damos_va_mthp_split()
-  -> damon_collapse_folio_range()    -> damon_spe_hot_fraction()
-  -> collapse_huge_page()            -> hot_pct < hot_threshold?
-       [anon only]                      -> split_folio_to_order()
-                                         [anon + shmem]
-
-Collapse (patches 1-3):
-  Reuses existing DAMOS_COLLAPSE action.  target_order=0 preserves
-  the existing madvise(MADV_COLLAPSE) path.  No external mmap lock.
-
-Split (patches 4-6):
-  New DAMOS_MTHP_SPLIT action with configurable hot_threshold (default
-  30%, sysfs-tunable).  split_folio_to_order() supports both anon and
-  shmem folios -- critical for tmpfs/KVM scenarios.
-
-  When SPE heatmap data is unavailable (no CONFIG_DAMON_SPE, or
-  PMD-mapped THPs without PTE access bits), the handler splits
-  unconditionally -- DAMON access pattern filtering has already
-  identified the region as cold.
-
-SPE Feedback (patch 6, three-phase):
-  Phase 2a -- PTE access bits via folio_walk (fallback).
-  Phase 2b -- Userspace SPE daemon -> debugfs -> kernel rbtree (ready).
-  Phase 2c -- Kernel-native ARM SPE event handler (future).
-
-sysfs interface:
-  /sys/kernel/mm/damon/admin/kdamonds/.../schemes/0/target_order
-  /sys/kernel/mm/damon/admin/kdamonds/.../schemes/0/hot_threshold
-
-Test Results (ARM64 VM, 256MB anon, 60s)
-----------------------------------------
-Collapse: nr_applied=10  sz_applied=69206016  AnonHugePages->67584kB
-Split:    nr_applied=11  sz_applied=73400320  AnonHugePages->0kB (16KB mTHP)
-Round-trip: AnonHugePages 67584->0->67584
-
-Compilation: gcc 15.2.0, ARM64 native, zero warnings.
-
-Known limitations
-- Collapse limited to anon; khugepaged mTHP support pending upstream.
-- SPE hardware required for hot/cold detection; unconditional split
-  without it.
-- khugepaged may re-collapse DAMON-split THPs (ping-pong).
-
-Wang Lian (6):
+Wang Lian (5):
   mm/damon: add target_order field for DAMOS_COLLAPSE
   mm/khugepaged: add damon_collapse_folio_range() for external callers
   mm/damon/vaddr: implement mTHP-aware DAMOS_COLLAPSE handler
-  mm/damon: introduce DAMOS_MTHP_SPLIT action and hot_threshold
-  mm/damon/vaddr: implement DAMOS_MTHP_SPLIT handler
-  mm/damon: add SPE feedback for sub-THP split decisions
+  mm/damon: introduce DAMOS_SPLIT action
+  mm/damon/vaddr: implement DAMOS_SPLIT handler
 
- include/linux/damon.h      |  18 ++
- include/linux/khugepaged.h |   3 +
- mm/damon/Kconfig           |  12 +
- mm/damon/Makefile          |   1 +
- mm/damon/core.c            |   3 +
- mm/damon/spe.c             | 499 +++++++++++++++++++++++++++++++++++++
- mm/damon/spe.h             |  62 +++++
- mm/damon/sysfs-schemes.c   |  96 +++++++
- mm/damon/vaddr.c           | 124 +++++++++
- mm/khugepaged.c            |  39 +++
- 10 files changed, 857 insertions(+)
- create mode 100644 mm/damon/spe.c
- create mode 100644 mm/damon/spe.h
+ include/linux/damon.h      |  10 ++++
+ include/linux/khugepaged.h |   3 ++
+ mm/damon/sysfs-schemes.c   |  57 ++++++++++++++++++++
+ mm/damon/vaddr.c           | 106 +++++++++++++++++++++++++++++++++++++
+ mm/khugepaged.c            |  39 ++++++++++++++
+ 5 files changed, 215 insertions(+)
 
-
-base-commit: 01a87376d94249407343653a63e8ecfbe4c79cda
---
+-- 
 2.50.1 (Apple Git-155)
 
