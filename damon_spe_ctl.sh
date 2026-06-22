@@ -80,7 +80,7 @@ step_collect_spe() {
 
 	info "step 1: collecting ARM SPE data for ${SPE_INTERVAL}s..."
 	perf record -e arm_spe_0/ts_enable=1,pa_enable=1,min_latency=0/ \
-		-a -o "$tmpdir/perf.data" -- sleep "$SPE_INTERVAL" 2>"$tmpdir/perf_record.log"
+		-p "$TARGET_PID" -o "$tmpdir/perf.data" -- sleep "$SPE_INTERVAL" 2>"$tmpdir/perf_record.log"
 
 	info "  $(wc -c < "$tmpdir/perf.data") bytes recorded"
 }
@@ -127,9 +127,9 @@ step_configure_damon() {
 
 	info "step 4: configuring DAMON with $nr_filters address filters..."
 
-	# stop if running
-	echo off > $DAMON/kdamonds/0/state 2>/dev/null || true
-
+	# Reset DAMON: writing nr_kdamonds creates kdamonds/0/ directory.
+	# Must do this BEFORE accessing kdamonds/0/state.
+	echo 0 > $DAMON/kdamonds/nr_kdamonds 2>/dev/null || true
 	echo 1 > $DAMON/kdamonds/nr_kdamonds
 
 	local ctx=$DAMON/kdamonds/0/contexts
@@ -185,6 +185,8 @@ step_run() {
 	info "  running for 5s..."
 	sleep 5
 
+	# Sync stats from running context to sysfs before stopping
+	echo update_schemes_stats > $DAMON/kdamonds/0/state
 	echo off > $DAMON/kdamonds/0/state
 
 	local stats=$DAMON/kdamonds/0/contexts/0/schemes/0/stats
