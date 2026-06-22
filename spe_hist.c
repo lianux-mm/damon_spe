@@ -214,15 +214,55 @@ static void print_report(void)
 	}
 }
 
+/* Print machine-readable split candidates for piping to pfn_to_va */
+static void print_split_candidates(int threshold)
+{
+	int i, j;
+	int count = 0;
+
+	for (i = 0; i < nr_thps; i++) {
+		struct thp_entry *e = &hist[i];
+		unsigned long max_cnt = 0, hot_pages = 0;
+
+		if (e->total == 0)
+			continue;
+
+		for (j = 0; j < PMD_PAGES; j++)
+			if (e->counts[j] > max_cnt)
+				max_cnt = e->counts[j];
+
+		unsigned long sig = max_cnt / 10;
+		if (sig == 0) sig = 1;
+		for (j = 0; j < PMD_PAGES; j++)
+			if (e->counts[j] >= sig)
+				hot_pages++;
+
+		int hot_pct = (int)(hot_pages * 100 / PMD_PAGES);
+		if (hot_pct < threshold) {
+			printf("PFN 0x%lx hot_fraction:%d total:%lu\n",
+			       e->pfn_base, hot_pct, e->total);
+			count++;
+		}
+	}
+	fprintf(stderr, "spe_hist: %d/%d THPs below %d%% threshold\n",
+		count, nr_thps, threshold);
+}
+
 int main(int argc, char **argv)
 {
 	char *line = NULL;
 	size_t len = 0;
 	ssize_t n;
 	int max_lines = 0;
+	int threshold = -1;
+	int i;
 
-	if (argc > 1)
-		max_lines = atoi(argv[1]);
+	for (i = 1; i < argc; i++) {
+		if (strcmp(argv[i], "--threshold") == 0 && i + 1 < argc)
+			threshold = atoi(argv[++i]);
+		else if (argv[i][0] != '-')
+			max_lines = atoi(argv[i]);
+	}
 
 	fprintf(stderr, "SPE histogram builder ready, reading from stdin...\n");
 
@@ -234,6 +274,11 @@ int main(int argc, char **argv)
 	}
 
 	free(line);
-	print_report();
+
+	if (threshold >= 0)
+		print_split_candidates(threshold);
+	else
+		print_report();
+
 	return 0;
 }
