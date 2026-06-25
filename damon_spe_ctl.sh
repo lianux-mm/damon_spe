@@ -227,11 +227,17 @@ step_configure_damon() {
 	info "step 4/5: configuring DAMON with $nr_filters address filters..."
 
 	# Reset DAMON cleanly
-	echo off > $DAMON/kdamonds/0/state 2>/dev/null || true
-	echo 0 > $DAMON/kdamonds/nr_kdamonds 2>/dev/null || true
+	echo 0 > "$DAMON/kdamonds/nr_kdamonds" 2>/dev/null || true
 	sleep 0.5
+	echo 1 > "$DAMON/kdamonds/nr_kdamonds"
 
-	echo 1 > $DAMON/kdamonds/nr_kdamonds
+	# wait for kdamonds/0/ to appear
+	local retry=10
+	while [ ! -d "$DAMON/kdamonds/0" ] && [ "$retry" -gt 0 ]; do
+		sleep 0.1
+		retry=$((retry - 1))
+	done
+	[ -d "$DAMON/kdamonds/0" ] || die "kdamonds/0 not created after reset"
 
 	local ctx=$DAMON/kdamonds/0/contexts
 	echo 1 > $ctx/nr_contexts
