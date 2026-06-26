@@ -48,7 +48,7 @@ REGION_END=""
 TARGET_ORDER=2
 SPE_INTERVAL=10
 HOT_THRESHOLD=30
-DAMON_RUN_TIME=5
+DAMON_RUN_TIME=60
 MAX_FILTERS=256
 CONTINUOUS=0
 DRY_RUN=0
@@ -79,7 +79,7 @@ Options:
   --order N         Split target order (default: 2 = 16KB)
   --interval N      SPE sampling duration in seconds (default: 10)
   --threshold N     Hot fraction threshold % (default: 30)
-  --run-time N      DAMON run time per cycle in seconds (default: 5)
+  --run-time N      DAMON run time per cycle in seconds (default: 60)
   --max-filters N   Max address filters per cycle (default: 256)
   --continuous      Run in continuous loop (default: one-shot)
   --loop-delay N    Delay between continuous cycles in seconds (default: 30)
@@ -225,7 +225,12 @@ step_pfn_to_va() {
 		return 1
 	fi
 
-	# merge adjacent 2MB ranges to reduce filter count
+	# merge adjacent 2MB ranges to reduce filter count.
+	# Skip the merged result if it collapses everything into a single
+	# filter that covers the entire monitoring region — DAMON address
+	# filter shows sz_tried=0 in that case (boundary condition with
+	# monitoring region exactly matching filter range).  Fall back to
+	# unmerged individual ranges.
 	local merged="$tmp/va_ranges_merged.txt"
 	sort -k1,1 "$out" | awk -v pmd=$((2*1024*1024)) '
 	BEGIN { count=0 }
@@ -241,8 +246,12 @@ step_pfn_to_va() {
 
 	local orig_nr=$nr
 	nr=$(wc -l < "$merged")
-	[ "$orig_nr" -ne "$nr" ] && verb "merged $orig_nr ranges → $nr ranges"
-	cp "$merged" "$out"
+	if [ "$nr" -eq 1 ] && [ "$orig_nr" -gt 1 ]; then
+		verb "merge would collapse $orig_nr ranges to 1, keeping unmerged"
+	else
+		[ "$orig_nr" -ne "$nr" ] && verb "merged $orig_nr ranges → $nr ranges"
+		cp "$merged" "$out"
+	fi
 
 	# cap at MAX_FILTERS
 	if [ "$nr" -gt "$MAX_FILTERS" ]; then
