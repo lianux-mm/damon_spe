@@ -82,11 +82,17 @@ count_thp() {
 setup_damon() {
 	info "configuring DAMON sysfs"
 
-	# stop if running
-	echo off > $DAMON/kdamonds/0/state 2>/dev/null || true
-
-	# set nr_kdamonds
+	# Reset and initialize DAMON
+	echo 0 > $DAMON/kdamonds/nr_kdamonds 2>/dev/null || true
+	sleep 0.5
 	echo 1 > $DAMON/kdamonds/nr_kdamonds
+
+	# wait for kdamonds/0/ to appear
+	for _ in $(seq 1 10); do
+		[ -d "$DAMON/kdamonds/0" ] && break
+		sleep 0.1
+	done
+	[ -d "$DAMON/kdamonds/0" ] || die "kdamonds/0 not created"
 
 	local ctx=$DAMON/kdamonds/0/contexts
 	echo 1 > $ctx/nr_contexts
@@ -103,10 +109,17 @@ setup_damon() {
 	echo $addr > $regions/0/start
 	printf "0x%lx" $((addr + size)) > $regions/0/end
 
-	# scheme: action=split
+	# scheme: auto-detect action name (v2: split, v1: mthp_split)
 	local sch=$ctx/0/schemes
 	echo 1 > $sch/nr_schemes
-	echo split > $sch/0/action
+	local action=""
+	for try in split mthp_split; do
+		if echo "$try" > $sch/0/action 2>/dev/null; then
+			action="$try"
+			break
+		fi
+	done
+	[ -n "$action" ] || die "neither split nor mthp_split supported"
 	echo $TARGET_ORDER > $sch/0/target_order
 
 	# access pattern: target cold regions (min_nr_accesses=0, max_nr_accesses=0)
@@ -159,7 +172,7 @@ check_result() {
 }
 
 cleanup() {
-	echo off > $DAMON/kdamonds/0/state 2>/dev/null || true
+	echo 0 > $DAMON/kdamonds/nr_kdamonds 2>/dev/null || true
 	kill $WORKLOAD_PID 2>/dev/null || true
 	rm -f /tmp/damos_split_test /tmp/damos_split_test.c /tmp/damos_split_info.txt
 }

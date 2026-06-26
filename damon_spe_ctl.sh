@@ -290,10 +290,23 @@ step_configure_damon() {
 	echo "$REGION_START" > $ctx/0/targets/0/regions/0/start
 	echo "$REGION_END"   > $ctx/0/targets/0/regions/0/end
 
+	# detect available action name: v2 kernel uses "split", v1 uses "mthp_split"
+	detect_action() {
+		local try
+		for try in split mthp_split; do
+			if echo "$try" > /sys/kernel/mm/damon/admin/kdamonds/0/contexts/0/schemes/0/action 2>/dev/null; then
+				echo "$try"
+				return 0
+			fi
+		done
+		die "neither split nor mthp_split action supported by this kernel"
+	}
+	DAMON_ACTION=$(detect_action)
+
 	# scheme: action=split, target_order=N
 	local sch=$ctx/0/schemes
 	echo 1 > $sch/nr_schemes
-	echo split > $sch/0/action
+	echo "$DAMON_ACTION" > $sch/0/action
 	echo "$TARGET_ORDER" > $sch/0/target_order
 
 	# access pattern: default min=0 to handle both T1 blind spot and T2 inflation
@@ -361,8 +374,10 @@ step_run() {
 # ===== Dry-run: analyze without touching DAMON =====
 dry_run() {
 	local tmp="$1"
+	local mode="SPE"
 
-	info "=== DRY RUN ==="
+	[ "$NO_SPE" -eq 1 ] && mode="smaps"
+	info "=== DRY RUN ($mode) ==="
 	info ""
 	info "  pid:       $TARGET_PID"
 	info "  region:    $REGION_START - $REGION_END"
@@ -370,24 +385,31 @@ dry_run() {
 	info "  threshold: ${HOT_THRESHOLD}%"
 	info ""
 
-	step_collect_spe "$tmp" || return 1
-	step_analyze "$tmp"
+	if [ "$NO_SPE" -eq 1 ]; then
+		step_smaps_scan "$tmp/va_ranges.txt" "$TARGET_PID" || {
+			info "no THP ranges found via smaps"
+			return 0
+		}
+	else
+		step_collect_spe "$tmp" || return 1
+		step_analyze "$tmp"
 
-	local nr_sparse=$(wc -l < "$tmp/sparse_thps.txt" 2>/dev/null || echo 0)
-	if [ "$nr_sparse" -eq 0 ]; then
-		info "no sparse THPs found, nothing to split"
-		return 0
+		local nr_sparse=$(wc -l < "$tmp/sparse_thps.txt" 2>/dev/null || echo 0)
+		if [ "$nr_sparse" -eq 0 ]; then
+			info "no sparse THPs found, nothing to split"
+			return 0
+		fi
+
+		step_pfn_to_va "$tmp" || {
+			info "no PFN→VA matches — sparse THPs may not belong to pid $TARGET_PID"
+			info ""
+			info "top sparse THPs (physical PFNs):"
+			head -5 "$tmp/sparse_thps.txt" | while read -r line; do
+				echo "  $line"
+			done
+			return 0
+		}
 	fi
-
-	step_pfn_to_va "$tmp" || {
-		info "no PFN→VA matches — sparse THPs may not belong to pid $TARGET_PID"
-		info ""
-		info "top sparse THPs (physical PFNs):"
-		head -5 "$tmp/sparse_thps.txt" | while read -r line; do
-			echo "  $line"
-		done
-		return 0
-	}
 
 	local nr_va=$(wc -l < "$tmp/va_ranges.txt")
 	info ""
@@ -458,8 +480,8 @@ print_summary() {
 # ===== Signal handler =====
 cleanup() {
 	info "cleaning up DAMON..."
-	echo off > "$DAMON/kdamonds/0/state" 2>/dev/null || true
-	print_summary
+	echo 0 > "$DAMON/kdamonds/nr_kdamonds" 2>/dev/null || true
+	info "done"
 	exit 0
 }
 
