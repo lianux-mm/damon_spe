@@ -86,8 +86,15 @@ AH=$(awk '/AnonHugePages:/{s+=$2}END{print s}' /proc/$WL_PID/smaps 2>/dev/null |
 info "workload: PID=$WL_PID  region=$REGION_START-$REGION_END  AnonHugePages=${AH}kB"
 
 # ===== 4. 运行 SPE 流水线 =====
-info "启动 SPE 流水线（interval=${INTERVAL}s, threshold=${THRESHOLD}%）..."
+# Default to --no-spe smaps mode: ARM SPE phys_addr → pfn_to_va
+# reverse mapping can be unreliable (0 matches on some hardware),
+# and the merge step combining adjacent THP ranges into one big
+# filter triggers a DAMON address filter boundary condition where
+# sz_tried=0.  smaps-based THP range discovery is simpler and
+# proven reliable.  Remove --no-spe for SPE-based sparse detection.
+info "启动 split 流水线（${INTERVAL}s smaps scan, threshold=${THRESHOLD}%）..."
 "$SCRIPT_DIR/damon_spe_ctl.sh" \
+    --no-spe \
     --pid "$WL_PID" \
     --start "$REGION_START" \
     --end "$REGION_END" \
