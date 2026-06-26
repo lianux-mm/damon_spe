@@ -290,23 +290,20 @@ step_configure_damon() {
 	echo "$REGION_START" > $ctx/0/targets/0/regions/0/start
 	echo "$REGION_END"   > $ctx/0/targets/0/regions/0/end
 
-	# detect available action name: v2 kernel uses "split", v1 uses "mthp_split"
-	detect_action() {
-		local try
-		for try in split mthp_split; do
-			if echo "$try" > /sys/kernel/mm/damon/admin/kdamonds/0/contexts/0/schemes/0/action 2>/dev/null; then
-				echo "$try"
-				return 0
-			fi
-		done
-		die "neither split nor mthp_split action supported by this kernel"
-	}
-	DAMON_ACTION=$(detect_action)
-
 	# scheme: action=split, target_order=N
 	local sch=$ctx/0/schemes
 	echo 1 > $sch/nr_schemes
-	echo "$DAMON_ACTION" > $sch/0/action
+
+	# detect available action name: v2 kernel uses "split", v1 uses "mthp_split"
+	local action=""
+	for try in split mthp_split; do
+		if echo "$try" > $sch/0/action 2>/dev/null; then
+			action="$try"
+			break
+		fi
+	done
+	[ -n "$action" ] || die "neither split nor mthp_split action supported by this kernel"
+
 	echo "$TARGET_ORDER" > $sch/0/target_order
 
 	# access pattern: default min=0 to handle both T1 blind spot and T2 inflation
