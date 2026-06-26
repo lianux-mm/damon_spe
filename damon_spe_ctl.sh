@@ -53,6 +53,8 @@ MAX_FILTERS=256
 CONTINUOUS=0
 DRY_RUN=0
 LOOP_DELAY=30
+NO_SPE=0
+ACCESS_MIN=0
 
 # cumulative stats
 STAT_CYCLES=0
@@ -81,6 +83,8 @@ Options:
   --max-filters N   Max address filters per cycle (default: 256)
   --continuous      Run in continuous loop (default: one-shot)
   --loop-delay N    Delay between continuous cycles in seconds (default: 30)
+  --no-spe          Use /proc/smaps scanning instead of ARM SPE (for VMs)
+  --access-min N    Min nr_accesses for DAMON scheme (default: 0)
   --dry-run         Analyze SPE and show split candidates without configuring DAMON
 
 Examples:
@@ -109,6 +113,8 @@ parse_args() {
 		--max-filters) MAX_FILTERS="$2"; shift 2;;
 		--loop-delay) LOOP_DELAY="$2"; shift 2;;
 		--continuous) CONTINUOUS=1; shift;;
+		--no-spe)     NO_SPE=1; shift;;
+		--access-min) ACCESS_MIN="$2"; shift 2;;
 		--dry-run)    DRY_RUN=1; shift;;
 		-h|--help)    usage;;
 		*)            die "unknown option: $1";;
@@ -121,14 +127,46 @@ parse_args() {
 }
 
 check_tools() {
-	[ -x "$SPE_HIST" ]  || die "spe_hist not found (run: gcc -O2 -o spe_hist spe_hist.c)"
-	[ -x "$PFN_TO_VA" ] || die "pfn_to_va not found (run: gcc -O2 -o pfn_to_va pfn_to_va.c)"
-	command -v perf >/dev/null || die "perf not found"
 	[ "$DRY_RUN" -eq 1 ] && return
 
+	if [ "$NO_SPE" -eq 0 ]; then
+		[ -x "$SPE_HIST" ]  || die "spe_hist not found (run: gcc -O2 -o spe_hist spe_hist.c)"
+		[ -x "$PFN_TO_VA" ] || die "pfn_to_va not found (run: gcc -O2 -o pfn_to_va pfn_to_va.c)"
+		command -v perf >/dev/null || die "perf not found"
+	fi
 	[ -d "$DAMON" ] || die "DAMON sysfs not found at $DAMON"
 	kill -0 "$TARGET_PID" 2>/dev/null || die "PID $TARGET_PID not running"
 	[ "$(id -u)" -eq 0 ] || die "must run as root for DAMON sysfs"
+}
+
+# ===== smaps fallback: find all THP-backed ranges without SPE =====
+step_smaps_scan() {
+	local out="$1"
+	local pid="$2"
+
+	info "step 1/3: scanning /proc/$pid/smaps for THP-backed ranges..."
+
+	awk -v region_start="$REGION_START" -v region_end="$REGION_END" '
+	/^[0-9a-f]+-[0-9a-f]+/ {
+		split($1, a, "-")
+		seg_start = strtonum("0x" a[1])
+		seg_end   = strtonum("0x" a[2])
+	}
+	/AnonHugePages:/ && $2 > 0 {
+		# this VMA has THP, only output 2MB-aligned ranges within monitoring region
+		pmd = 2 * 1024 * 1024
+		s = seg_start
+		if (s % pmd != 0) s = s + pmd - (s % pmd)
+		while (s + pmd <= seg_end) {
+			printf "0x%lx 0x%lx 0\n", s, s + pmd
+			s += pmd
+		}
+	}' "/proc/$pid/smaps" > "$out"
+
+	local nr=$(wc -l < "$out")
+	verb "found $nr THP-backed 2MB ranges"
+	[ "$nr" -gt 0 ] && return 0
+	return 1
 }
 
 # ===== Step 1: Collect ARM SPE samples =====
@@ -258,13 +296,13 @@ step_configure_damon() {
 	echo split > $sch/0/action
 	echo "$TARGET_ORDER" > $sch/0/target_order
 
-	# access pattern: match accessed regions (min_nr_accesses >= 1)
+	# access pattern: default min=0 to handle both T1 blind spot and T2 inflation
 	# the address filter does the fine-grained selection
 	local ap=$sch/0/access_pattern
-	printf "0x%lx" $((4096))             > $ap/sz/min   # at least one page
+	printf "0x%lx" $((4096))             > $ap/sz/min
 	printf "0x%lx" $((1024*1024*1024*1024)) > $ap/sz/max
-	echo 1    > $ap/nr_accesses/min   # must show some access
-	echo 1000 > $ap/nr_accesses/max
+	echo "$ACCESS_MIN" > $ap/nr_accesses/min
+	echo 1000          > $ap/nr_accesses/max
 	echo 0    > $ap/age/min
 	echo $((1024*1024)) > $ap/age/max
 
@@ -365,24 +403,44 @@ dry_run() {
 # ===== Main one-shot cycle =====
 run_one_cycle() {
 	local tmp=$(mktemp -d)
+	local mode="SPE"
 
-	info "=== SPE → DAMOS_SPLIT cycle #${STAT_CYCLES} ==="
+	[ "$NO_SPE" -eq 1 ] && mode="smaps"
+	info "=== $mode → DAMOS_SPLIT cycle #${STAT_CYCLES} ==="
 	info ""
 
-	step_collect_spe "$tmp" || { rm -rf "$tmp"; return 1; }
-	step_analyze "$tmp"
+	if [ "$NO_SPE" -eq 1 ]; then
+		# smaps-based: scan /proc/<pid>/smaps for THP ranges
+		step_smaps_scan "$tmp/va_ranges.txt" "$TARGET_PID" || {
+			verb "no THP ranges found via smaps"
+			rm -rf "$tmp"
+			return 0
+		}
+	else
+		# SPE-based: perf → spe_hist → pfn_to_va
+		step_collect_spe "$tmp" || { rm -rf "$tmp"; return 1; }
+		step_analyze "$tmp"
 
-	local nr_sparse=$(wc -l < "$tmp/sparse_thps.txt" 2>/dev/null || echo 0)
-	if [ "$nr_sparse" -eq 0 ]; then
-		verb "no sparse THPs this cycle, skipping split"
-		rm -rf "$tmp"
-		return 0
+		local nr_sparse=$(wc -l < "$tmp/sparse_thps.txt" 2>/dev/null || echo 0)
+		if [ "$nr_sparse" -eq 0 ]; then
+			verb "no sparse THPs this cycle, skipping split"
+			rm -rf "$tmp"
+			return 0
+		fi
+
+		step_pfn_to_va "$tmp" || { rm -rf "$tmp"; return 0; }
 	fi
 
-	step_pfn_to_va "$tmp" || { rm -rf "$tmp"; return 0; }
+	local nr_ranges=$(wc -l < "$tmp/va_ranges.txt" 2>/dev/null || echo 0)
+	if [ "$nr_ranges" -gt "$MAX_FILTERS" ]; then
+		verb "capping at $MAX_FILTERS (was $nr_ranges)"
+		head -n "$MAX_FILTERS" "$tmp/va_ranges.txt" > "$tmp/va_ranges_capped.txt"
+		mv "$tmp/va_ranges_capped.txt" "$tmp/va_ranges.txt"
+	fi
+	echo "$(wc -l < "$tmp/va_ranges.txt")" > "$tmp/va_count.txt"
+
 	step_configure_damon "$tmp"
 	step_run
-
 	rm -rf "$tmp"
 }
 
